@@ -150,3 +150,47 @@ handles the same concern (`agents/core/src/envelope.rs`).
 - Room (`@Entity`/`@Dao`/`@Database`) — https://developer.android.com/training/data-storage/room
 - Battery monitoring — https://developer.android.com/training/monitoring-device-state/battery-monitoring
 - JNI naming convention — https://docs.oracle.com/en/java/javase/17/docs/specs/jni/design.html#resolving-native-method-names
+
+## Build status: VERIFIED (2026-07-06)
+
+The Kotlin agent + native core now build into a real APK on Linux
+(Ubuntu 24.04, Temurin JDK 17, Android SDK cmdline-tools, Gradle 8.9,
+compileSdk 35 / build-tools 35, NDK r27). Output:
+`app/build/outputs/apk/debug/app-debug.apk` (~18 MB) with all three native
+ABIs (`arm64-v8a`, `armeabi-v7a`, `x86_64`) bundled under `lib/`.
+
+Two skeleton bugs were found and fixed by building for real:
+1. `gradle.properties` was missing `android.useAndroidX=true` (added).
+2. `kotlinx-serialization-json` 1.7.1 requires Kotlin 2.0; pinned to 1.6.3 to
+   match the Kotlin 1.9.24 plugin.
+
+### Reproduce
+```bash
+export JAVA_HOME=/usr/lib/jvm/temurin-17-jdk-amd64
+export ANDROID_HOME="$HOME/Android/Sdk"
+echo "sdk.dir=$ANDROID_HOME" > local.properties
+./gradlew :app:assembleDebug        # wrapper is committed
+```
+
+### Native core (jniLibs)
+`cargo-ndk` 4.1.2 panics against NDK r27, so cross-compile the Rust core with
+plain cargo + the NDK clang wrappers instead (produces the `.so` per ABI into
+`app/src/main/jniLibs/`, which is gitignored as a build artifact):
+```bash
+NDK="$ANDROID_HOME/ndk/27.0.12077973"
+BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+cd ../core
+for t in aarch64-linux-android:aarch64-linux-android:arm64-v8a \
+         armv7-linux-androideabi:armv7a-linux-androideabi:armeabi-v7a \
+         x86_64-linux-android:x86_64-linux-android:x86_64; do
+  triple=${t%%:*}; rest=${t#*:}; clangp=${rest%%:*}; abi=${rest##*:}
+  env AR="$BIN/llvm-ar" \
+      CARGO_TARGET_$(echo $triple|tr 'a-z-' 'A-Z_')_LINKER="$BIN/${clangp}26-clang" \
+      CC_${triple}="$BIN/${clangp}26-clang" AR_${triple}="$BIN/llvm-ar" \
+      cargo build --release --target $triple --features jni
+  mkdir -p ../android/app/src/main/jniLibs/$abi
+  cp target/$triple/release/libcadence_agent_core.so ../android/app/src/main/jniLibs/$abi/
+done
+```
+The resulting `.so` exports the 8 `Java_com_cadence_agent_core_CoreBridge_native*`
+symbols `CoreBridge.kt` binds to (verified via `llvm-nm -D`).

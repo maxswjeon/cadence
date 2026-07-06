@@ -1,0 +1,10 @@
+# Android/Gradle build outputs
+.gradle/
+build/
+app/build/
+# Machine-specific SDK path
+local.properties
+# Cross-compiled native libs are build artifacts (regenerate via the NDK cross-build
+# documented in README.md); do not commit the .so binaries.
+app/src/main/jniLibs/**/*.so
+# Keep the Gradle wrapper (gradlew, gradle-wrapper.jar) committed — do NOT ignore it.
