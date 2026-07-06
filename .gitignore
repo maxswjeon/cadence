@@ -39,3 +39,14 @@ data/
 .idea/
 .vscode/
 *.swp
+
+# Rust build artifacts
+agents/core/target/
+target/
+
+# Nested OMC runtime state (created by workers running in subdirs)
+**/.omc/state/
+**/.omc/sessions/
+**/.omc/artifacts/
+**/.omc/logs/
+**/.omc/handoffs/

@@ -1,0 +1,30 @@
+[package]
+name = "cadence-agent-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Portable, crash-safe capture core for Cadence device agents (WAL, dedupe, backpressure, mTLS transport)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A `cdylib` is emitted so the Android (JNI) and Windows (P/Invoke) agents can bind
+# to the same core via FFI; `rlib` keeps it usable as a normal Rust dependency/test target.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["https"]
+# The reqwest/rustls mTLS transport. Tests do not need it (they use MockTransport),
+# but it is on by default so `cargo build/clippy/test` all lint the real transport.
+https = ["dep:reqwest"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+crc32fast = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"

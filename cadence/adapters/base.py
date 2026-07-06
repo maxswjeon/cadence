@@ -56,6 +56,11 @@ class AcquisitionTier(StrEnum):
     FILE_IMPORT = "file_import"          # imported export/log file
     NOTIFICATION_WAL = "notification_wal"  # device notification WAL capture
     SCRAPE_NONROOT = "scrape_nonroot"    # non-root on-device scrape
+    DEVICE_OS_API = "device_os_api"      # direct on-device OS/system-API read, not otherwise
+                                          # categorized (app-usage, active-window, telemetry,
+                                          # SMS provider, location); notifications keep
+                                          # NOTIFICATION_WAL, non-root messenger scrape keeps
+                                          # SCRAPE_NONROOT
     MANUAL = "manual"                    # manually entered
     UNKNOWN = "unknown"
 

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AccessibilityServiceInfo config for CadenceAccessibilityService (Decision B idle-room
+  scrape). Docs: https://developer.android.com/guide/topics/ui/accessibility/service#config
+
+  android:packageNames is intentionally narrow (KakaoTalk only): per the consensus plan's
+  S0.1 gate, "each messenger must individually pass S0.1 before it graduates from
+  import/observe-only to accessibility scraping" — LINE/KakaoWork/LINE Works/JANDI/Naver
+  are added to @array/accessibility_target_packages (strings.xml) one at a time, each only
+  after its own read-state safety probe passes. Listing a package here is NOT itself
+  evidence that app has passed S0.1 — see CadenceAccessibilityService#onServiceConnected.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="200"
+    android:packageNames="@array/accessibility_target_packages"
+    android:description="@string/accessibility_service_description" />

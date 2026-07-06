@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cadence Android agent — Milestone 2 (W3) SOURCE SKELETON.
+  Faithful to the real Android permission/service model, but this project has never been
+  built (no Android SDK/Gradle/JDK-for-Android available in the authoring environment).
+  Do not assume it compiles — see ../../README.md for the honest build status, the
+  non-destructive invariants, and the gated/NOT-implemented list.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ============================================================================
+         Capture-surface permissions (milestone-2 consensus plan, Decision G /
+         §Data Sources). Each is exactly what its corresponding collector needs — no
+         broader grant than the class that uses it.
+         ============================================================================ -->
+
+    <!-- SmsReader: content://sms read (Telephony.Sms). Dangerous permission, runtime-requested. -->
+    <uses-permission android:name="android.permission.READ_SMS" />
+
+    <!-- AppUsageCollector: UsageStatsManager. A "special" permission — NOT grantable via a
+         runtime dialog; the user must be sent to Settings.ACTION_USAGE_ACCESS_SETTINGS. -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- LocationBleCollector: place-based presence prior (S0.4). Background location is
+         its own separate runtime grant on Android 10+ (requested only after foreground
+         location is already granted, per Play policy). -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+    <!-- LocationBleCollector: BLE scanning (Android 12+ runtime permission). Not flagged
+         neverForLocation — this agent already holds ACCESS_FINE_LOCATION and uses BLE
+         results as a location-adjacent context prior (office-Pi-beacon proximity for
+         Decision I's owner-presence gate), never for third-party person-identification
+         (BLE MAC randomization makes that infeasible regardless — see S0.4 research). -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+
+    <!-- CaptureService: foreground service base permission + Android 14 per-type grants
+         matching its declared android:foregroundServiceType below. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <!-- CaptureService posts a persistent low-importance notification (required to run a
+         foreground service at all) — Android 13+ runtime permission. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- mTLS event-stream uplink to the brain (contract/protocol.md §1). Normal
+         permissions, no runtime prompt. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- NOTE: BIND_NOTIFICATION_LISTENER_SERVICE and BIND_ACCESSIBILITY_SERVICE (also
+         named in the W3 task scope) are NOT <uses-permission> entries — they are
+         system-only permissions declared on the <service> elements below via
+         android:permission, which is what actually restricts binding to the OS. See each
+         <service> for its docs citation. -->
+
+    <application
+        android:name=".CadenceApplication"
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:theme="@android:style/Theme.DeviceDefault">
+
+        <!-- Foreground orchestrator: Room-WAL drain into CoreBridge + the polling
+             collectors (SmsReader, AppUsageCollector, LocationBleCollector,
+             DeviceTelemetry). android:foregroundServiceType is required since Android 10
+             (mandatory since Android 14 for apps targeting API 34+); each type here needs
+             its matching FOREGROUND_SERVICE_* permission above.
+             Docs: https://developer.android.com/develop/background-work/services/foreground-services -->
+        <service
+            android:name=".capture.CaptureService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync|location|connectedDevice" />
+
+        <!-- READ-ONLY notification capture (Decision G "Passive mode" + Principle 1).
+             Bound by the system once the user grants notification-listener access
+             (Settings > Notification access) — the android:permission attribute (not a
+             <uses-permission>) is what the system enforces to restrict binding to itself.
+             Docs: https://developer.android.com/reference/android/service/notification/NotificationListenerService -->
+        <service
+            android:name=".notification.CadenceNotificationListenerService"
+            android:label="@string/notification_listener_label"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- Idle-room scrape ONLY (Decision B). Foreground-only reality: AccessibilityService
+             only ever sees the foreground window and cannot run with the screen off — every
+             backfill here happens inside a user-visible Sync Session (Decision G), never a
+             hidden background job.
+             Docs: https://developer.android.com/reference/android/accessibilityservice/AccessibilityService
+             Docs: https://developer.android.com/guide/topics/ui/accessibility/service -->
+        <service
+            android:name=".accessibility.CadenceAccessibilityService"
+            android:label="@string/accessibility_service_label"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+    </application>
+</manifest>

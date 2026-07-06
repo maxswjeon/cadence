@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Cadence Agent</string>
+    <string name="notification_listener_label">Cadence notification capture (read-only)</string>
+    <string name="accessibility_service_label">Cadence messenger sync (non-destructive)</string>
+    <string name="accessibility_service_description">
+        Scrolls back through idle KakaoTalk (and, once each individually passes its own
+        safety probe, other Korean messenger) rooms to back-fill message history.
+        Read-only: never marks a room read, dismisses, or edits anything.
+    </string>
+
+    <!-- KakaoTalk only until each additional messenger independently passes S0.1 (Decision
+         B / the consensus plan) — see accessibility_service_config.xml's comment. -->
+    <string-array name="accessibility_target_packages">
+        <item>com.kakao.talk</item>
+    </string-array>
+</resources>

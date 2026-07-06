@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <!--
+    NOTE (honest disclosure): this project cannot be built or restored in the
+    environment that authored it — there is no .NET SDK installed here (see
+    ../windows/README.md). Every signature below is written against the
+    documented .NET 8 / Win32 / UI Automation APIs cited in the source files,
+    but nothing in this tree has been compiled. Treat it as a source skeleton,
+    not a verified build.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>Cadence.WindowsAgent</RootNamespace>
+    <AssemblyName>CadenceWindowsAgent</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- LibraryImport-generated P/Invoke (CoreInterop, NativeMethods) needs unsafe
+         blocks for the byte*/pointer marshalling used at the Rust FFI boundary. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- Pulls in UIAutomationClient.dll / UIAutomationTypes.dll so
+         System.Windows.Automation (AutomationElement, TreeWalker, Condition)
+         is available to ActiveWindowCollector without building a full WPF app.
+         See: https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/ui-automation-fundamentals -->
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Generic Host + Windows Service integration.
+         https://learn.microsoft.com/en-us/dotnet/core/extensions/windows-service -->
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

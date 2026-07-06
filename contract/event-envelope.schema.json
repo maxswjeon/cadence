@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cadence.dev/schemas/contract/event-envelope/v1.schema.json",
+  "title": "Cadence Device→Brain Event Envelope",
+  "schema_version": "1.0.0",
+  "$comment": "Wire contract for POST /ingest/event. Field-for-field aligned with cadence.adapters.base.Event (source of truth: cadence/adapters/base.py). Structured-only: carries provenance POINTERS (raw_evidence_ref/payload_hash) and a bounded non-verbatim summary, never verbatim raw content (message/email/chat/audio/screenshot text). additionalProperties=false mirrors Event's model_config extra='forbid'. A future breaking revision bumps both the trailing path segment of $id and schema_version together.",
+  "description": "A single normalized, provenance-tagged event a device agent sends to the brain's ingest endpoint. Devices construct exactly one envelope per captured item; verbatim raw evidence never leaves the device except to the device-local/NAS evidence store referenced by raw_evidence_ref.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "source", "account_ref", "kind"],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable id of the source event, opaque to the brain (e.g. a provider message id or a device-local capture id)."
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Provider name, e.g. 'github', 'google_calendar', 'gmail', or a device-agent source like 'android_notification', 'windows_active_window'."
+    },
+    "account_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque per-account reference. NEVER a credential, token, or email address body — an opaque handle the brain's credential vault understands."
+    },
+    "acquisition_tier": {
+      "type": "string",
+      "enum": [
+        "official_api",
+        "oauth",
+        "user_token",
+        "file_import",
+        "notification_wal",
+        "scrape_nonroot",
+        "manual",
+        "unknown",
+        "device_os_api"
+      ],
+      "default": "unknown",
+      "description": "How the data was acquired — drives trust/compliance handling downstream. Device agents typically send 'notification_wal' (NotificationListener WAL capture), 'scrape_nonroot' (idle-room accessibility scrape), or 'device_os_api' (direct on-device OS/system-API reads not otherwise categorized: app-usage, active-window, device telemetry, SMS provider, location)."
+    },
+    "kind": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Event kind, e.g. 'github.issue', 'calendar.event', 'device.notification', 'device.app_usage'."
+    },
+    "occurred_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "default": null,
+      "description": "When the source event actually happened, UTC ISO-8601. Null if unknown."
+    },
+    "ingested_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this event was captured/ingested, UTC ISO-8601. Devices SHOULD omit this field and let the brain stamp receipt time; if set, it MUST be the device's own UTC capture instant (never null — omit instead of sending null)."
+    },
+    "device_id": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Originating device (a dedupe input and observability tag, not an auth credential)."
+    },
+    "dedupe_id": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Cross-device idempotency key. A device MAY set this itself (e.g. its own WAL content hash); if omitted, the brain derives sha256('{source}|{account_ref}|{event_id}') and dedupes on that instead."
+    },
+    "payload_hash": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-fA-F]{64}$",
+      "default": null,
+      "description": "SHA-256 hex digest of the raw payload (the bytes referenced by raw_evidence_ref), for integrity verification. Never the payload itself."
+    },
+    "raw_evidence_ref": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Opaque NAS blob id/hash for the verbatim raw evidence, if any was retained. Points at device-local/NAS storage — never a value the brain resolves to raw content itself."
+    },
+    "summary": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Short, NON-verbatim summary (e.g. 'notification from Messages app'). MUST NOT contain verbatim message/email/chat/transcript text; the brain's raw-boundary classifier independently rejects overlong or content-flagged summaries at write time."
+    },
+    "confidence": {
+      "type": ["number", "null"],
+      "default": null,
+      "description": "Optional confidence score for this observation, if the adapter/device computes one."
+    },
+    "structured": {
+      "type": "object",
+      "default": {},
+      "description": "Normalized, structured fields for this event (D1-projection inputs, e.g. 'due_at', 'title', 'actionable'). Convention-based per source/kind — see cadence.brain.projection. MUST NOT carry verbatim raw content; keys matching raw-content names (raw, body, text, content, message, email, chat, transcript, audio, voice, screenshot, ocr, attachment, photo, image, account_number, card_number, ssn, password, secret, token, credential) are structurally rejected here and independently by the brain's raw-boundary classifier.",
+      "propertyNames": {
+        "not": {
+          "pattern": "(?i)(^|[^a-z0-9])(raw|body|text|content|message|email|chat|transcript|audio|voice|screenshot|screen|ocr|snippet|verbatim|attachment|photo|image|account_number|acct_number|card_number|iban|ssn|password|secret|token|credential)($|[^a-z0-9])"
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "event_id": "android-notif-9f2c1",
+      "source": "android_notification",
+      "account_ref": "device:pixel-8:com.google.android.gm",
+      "acquisition_tier": "notification_wal",
+      "kind": "device.notification",
+      "occurred_at": "2026-07-06T14:32:00Z",
+      "device_id": "pixel-8-a1b2",
+      "dedupe_id": "3f1c9a6e2d4b7a0c8e5f6d1b2c3a4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d",
+      "payload_hash": "b2c3a4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d3f1c9a6e2d4b7a0c8e5f6d1",
+      "raw_evidence_ref": "nas://android-notif-9f2c1",
+      "summary": "notification from Gmail",
+      "confidence": 0.95,
+      "structured": {
+        "app_package": "com.google.android.gm",
+        "actionable": true
+      }
+    }
+  ]
+}
