@@ -1,0 +1,7 @@
+{
+  "omc": {
+    "deepInterview": {
+      "ambiguityThreshold": 0.1
+    }
+  }
+}

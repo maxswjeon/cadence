@@ -1,153 +1,106 @@
 # Cadence
 
-**Cadence is a self-hosted, single-user personal attention & context guardian.** It
-ingests events from your accounts and devices, turns them into provenance-tagged facts
-and deadlines, infers what actually matters right now, and — when it's confident — nudges
-you when your attention has drifted from it (the canonical case: you're immersed in the
-7-day task while the 1-day report is quietly coming due).
+Cadence is a self-hosted personal attention & context guardian: a brain that ingests events from your accounts and devices, turns them into provenance-tagged facts and deadlines, and (in later milestones) nudges you when your attention drifts from what actually matters. This repo currently holds **Milestone 1: Foundation** — the runnable spine the rest of Cadence is built on, with no live credentials, no recording, and no live-inference engine required to pass its tests.
 
-It is built to run on hardware you own, with a hard architectural boundary between *raw
-evidence* and *structured signal*, credentials that never leave a local vault, and every
-inference/nudge path **off by default** until you explicitly turn it on. Nothing records,
-sends, or infers silently.
+## What Milestone 1 actually contains
 
-> Status: this is a personal project, published source-available. It is functional
-> end-to-end in shadow mode (the brain runs, reasons, and proposes nudges) but a fully
-> "live" deployment requires you to plug in your own credentials, device tokens, and an
-> LLM provider — every such seam is documented and gated, never implicitly enabled.
+Built and tested (132 tests green):
 
----
+- **Source Adapter framework** (`cadence/adapters/base.py`) — the `Adapter` ABC (`fetch`/`normalize`/`emit`), the provenance-tagged `Event` schema, `AcquisitionTier` tagging, and an `AdapterRegistry` for per-account instances.
+- **Reference adapters, fixtures-based** (`cadence/adapters/github.py`, `cadence/adapters/gcal.py`, `cadence/adapters/email.py`) — GitHub (issues/PRs/review-requests), Google Calendar (events/attendees), and email (messages). Each stores the verbatim raw record in NAS and emits an `Event` carrying only structured fields + a non-verbatim summary. Exercised against recorded fixtures (`tests/fixtures/{github,google_calendar,email}/`) in `tests/test_adapters_reference.py` — no live network call.
+- **NAS-only credential vault** (`cadence/adapters/vault.py`) — encrypted-at-rest (stub cipher), per-account scoped, revocable; positively validates its directory resolves inside the configured NAS trust boundary (`settings.nas_root`, following symlinks), chmods the vault dir `0700` and each credential file `0600`, and refuses to start with the checked-in default master key when `CADENCE_ENV=prod`.
+- **D1 canonical store** (`cadence/stores/d1.py`, `cadence/stores/models.py`) — a local SQLite database that is the hot-path canonical store for `calendar_event`, `task`, `deadline`, `person`, `place`, `source_account`, `fact`, `nudge`, `feedback`, `sync_session`, plus an in-memory `CloudflareD1Replica` stub (async, no live HTTP) modeling the durable off-site replica. Timestamps use a `UTCDateTime` type decorator so reads always come back timezone-aware UTC even on SQLite; `source_account(provider, account_ref)` and `place.label` carry unique constraints.
+- **Raw-boundary enforcement** (`cadence/stores/raw_boundary.py`) — two layers: a structural per-table column allowlist (`SchemaBoundary`, built from the ORM metadata) that is the real guarantee — a write may reference only known columns, and free-text is accepted only on columns explicitly typed as summary/enum/id/hash/label — plus a heuristic `PayloadClassifier` (name denylist, separator-tolerant + Luhn-checked account/card numbers, base64-blob detection) as defense-in-depth. Enforced on every `D1Store.write`/`write_all` call and again when a row is enqueued to the Cloudflare replica.
+- **NAS + R2 stores** (`cadence/stores/nas.py`, `cadence/stores/r2.py`) — content-addressed local blob directories (raw evidence vs. derived blobs) plus a `TieringRouter` that keeps RAW → NAS, DERIVED_BLOB → R2, STRUCTURED → D1.
+- **Provenance fact graph** (`cadence/brain/facts.py`) — `FactGraph.assert_fact` writes NAS evidence + a deduped, provenance-carrying D1 row (`source_event_ids`, confidence, NAS pointer, expiration, feedback history).
+- **Typed-row projection** (`cadence/brain/projection.py`) — beyond the generic `Fact`, a pluggable `ProjectionRegistry` maps known event kinds (`calendar.event`, `github.issue`/`pull_request`/`review_request`, `email.message`) into first-class `calendar_event`/`task` rows, with idempotent get-or-create resolution of `source_account`/`place` entities (safe under concurrent inserts via unique-constraint retry).
+- **Ingestion pipeline** (`cadence/ingest/pipeline.py`) — a `WALBuffer` with backpressure, cross-device `dedupe_id` handling, projection, and routing into the fact graph and (via a pluggable `DeadlineExtractor`) into `deadline` rows. The whole per-event critical section is serialized behind an instance lock so concurrent FastAPI requests can't interleave.
+- **FastAPI brain** (`cadence/brain/app.py`) — `POST /ingest/event`, `GET /healthz`, `GET /metrics`. The per-app `require_mtls` dependency **fails closed** by default (`settings.require_mtls=True`): a request missing the `X-Client-Cert` header a TLS-terminating proxy would set is rejected with 401. It's still a stub (header presence only, no real certificate verification), but an accidental prod deploy can't silently accept unauthenticated callers; a `RawBoundaryViolation` on ingest returns 422.
+- **Deadline parser** (`cadence/brain/deadlines.py`) — `DeadlineExtractor` ABC + `DeadlineCandidate`, plus a concrete `RuleDeadlineExtractor` (rule/heuristic, no LLM call) that the FastAPI app wires in live: it pulls an explicit due date off `Event.structured` when present, pattern-matches an inferred deadline out of `Event.summary` (ISO/slash/month-name/Korean dates, `D-N` countdowns, "due"/"by"/"마감" keyword phrases), and reconciles the two per the explicit-over-inferred convention — flagging `divergence_flag` when they disagree on calendar date. It exposes an `llm_hook` seam for a future LLM-backed inference pass; none is implemented in M1.
+- **Observability skeleton** (`cadence/obs/`) — structured JSON logging, an alarm sink (`raw_to_cloud_violation`, `credential_vault_access`, `replication_queue_depth`), a raw-content egress ledger with the two sanctioned channels (`llm_text`, `daglo_audio`), a Prometheus-format `/metrics` renderer, and a provider-agnostic STT interface with a Daglo adapter stub that reads `DAGLO_API_KEY` but refuses to make any live call.
+- **Alembic migration** (`alembic/versions/0001_initial_schema.py`) — a frozen, explicit-DDL snapshot of the D1 schema (not autogenerated from live model state, so it stays reproducible independent of future model changes). `alembic/env.py` calls `Settings.ensure_dirs()` before resolving the DB URL, so `alembic upgrade head` works on a clean checkout with no manual setup.
 
-## What's built
+## What is deliberately excluded / gated
 
-Six milestones, all with tests (Python: **404 passing**, ruff clean; Rust core: `cargo
-test`/`clippy`/`fmt` clean). CI runs all of it on every push — see below.
+Per `.omc/plans/cadence-milestone-1-foundation.md` and `.omc/plans/cadence-consensus-plan.md`, this milestone builds **only** the foundation spine. Explicitly **not** built here:
 
-| # | Area | What it is |
-|---|------|-----------|
-| **M1** | **Foundation spine** | Source-Adapter framework, provenance `Event` schema, NAS-only credential vault, local-canonical D1 (SQLite) store, the structural raw-boundary, NAS/R2 blob tiers, the provenance fact graph, typed-row projection, the ingest pipeline (WAL + backpressure + dedupe), the FastAPI brain (fail-closed mTLS gate), a rule-based deadline parser, and an observability skeleton. |
-| **M2** | **Device agents** | A portable, crash-safe Rust capture core (`agents/core`: WAL, dedupe, backpressure, mTLS transport) exposed over a C ABI, with an Android (JNI) agent and a Windows (P/Invoke, net8.0) agent binding to it, plus the device↔brain wire contract. |
-| **M3** | **Attention & priority engine** | The reasoning loop: an `AttentionState` detector (idle/immersed/scattered), a priority + **misallocation** detector, and a **Nudge Governor** (precision-first, shadow/live modes, idempotency, Thanks/Dismiss feedback that adjusts thresholds). |
-| **M4** | **LLM inference path** | A gated provider abstraction (API-key and ChatGPT-OAuth), an unbypassable raw-content egress audit, an LLM-backed deadline/receptiveness inference wired into the pipeline seams, and an onboarding OAuth (PKCE) login flow — **off unless explicitly enabled + configured + credentialed**. |
-| **M5** | **Runtime** | The pieces that make it *run*: a resilient tick scheduler, nudge delivery (console / FCM HTTP v1 / mock), the LLM factory that only activates when gated conditions are met, a feedback endpoint, and one service entrypoint that composes the whole brain. |
-| **M6** | **Devbox source** | A capture source for an always-on dev server (the machine that runs your coding jobs while you're mobile): git WIP / stale-branch signals, "your run finished/crashed while you were away", activity cadence, and host health — **content-free and own-user-only by construction** (see Privacy). |
+- Office Raspberry Pi capture node (Decision I — counsel-recommended, presence-gated design; not started).
+- Any recording/audio capture or VAD (co-presence, meetings, phone calls) — gated behind the S0.5 compliance-controls step. The only audio-related code in this repo is the interface-only Daglo STT stub in `cadence/obs/stt.py`, which never makes a live call.
+- CODEF financial/government data integration — gated behind S0.5.
+- Live inference/nudging (the Nudge Governor, confidence-calibrated priority inference) — gated behind S0.2 calibration. M1 ships a rule/heuristic deadline extractor (no LLM), not the full inference engine.
+- Device agents (Android, Windows, watch).
+- VM surface (Instagram Stories sweep) and co-presence/speaker-ID sensing.
 
-The architecture rationale and the system invariants are documented in `AGENTS.md`.
+See `.omc/plans/cadence-consensus-plan.md` for the full architecture rationale (Decisions A–I) and `.omc/plans/cadence-milestone-1-foundation.md` for this milestone's exact scope and acceptance criteria.
 
-## Privacy & honesty posture (enforced in code, not just promised)
-
-- **Raw boundary is structural.** Every D1 write passes a per-table/column allowlist
-  (`SchemaBoundary`, built from the ORM metadata) plus a heuristic classifier backstop.
-  Raw evidence lives *only* in NAS, referenced by opaque id/hash; D1 and the Cloudflare
-  replica and R2 hold structured/derived data only. Verbatim content never reaches the
-  cloud.
-- **Credentials never leave a local, boundary-checked vault** (`nas_root`, chmod 0700/0600,
-  refuses the checked-in default master key in prod).
-- **Every raw-content egress is logged** through one of exactly two sanctioned channels
-  (`llm_text`, `daglo_audio`) via an audit that the LLM base client cannot bypass.
-- **Nothing goes live automatically.** The Nudge Governor defaults to *shadow* mode
-  (proposes, never delivers). The LLM factory returns a provider only when `llm_enabled`
-  **and** a provider is configured **and** the vault holds a matching credential —
-  otherwise `None`, with a logged reason.
-- **The ChatGPT-OAuth LLM path is opt-in and explicitly gray-zone** (it presents the
-  public Codex client to the ChatGPT backend; unsupported for non-Codex use, may break,
-  ToS gray). Onboarding prints the warning and requires confirmation. The API-key provider
-  is the supported, recommended default.
-- **Device/audio capture is gated.** No 24/7 recording; co-presence/audio (a presence-gated
-  office node) is a separately-gated design step, not enabled here.
-- **The devbox source is content-free and own-user-only.** It emits repo names/branches,
-  command *verbs* (never arguments), counts, timestamps and health — never source, diffs,
-  file names, env, secrets, or full command lines. It captures only the current user's
-  resources (uid/`$HOME` filtered, fails **closed** on an undeterminable owner; container
-  health is trusted only under rootless per-user Docker). Read-only.
-
-## Quickstart (the brain)
+## Quickstart
 
 ```bash
 pip install -e ".[dev]"
 
 # Apply the D1 schema (creates var/d1.sqlite by default; see cadence/config.py).
+# alembic/env.py calls Settings.ensure_dirs() first, so this works on a clean checkout.
 alembic upgrade head
 
-# Test + lint
+# Run the test suite
 pytest
+
+# Lint
 ruff check .
 
 # Run the FastAPI brain (dev)
 uvicorn cadence.brain.app:create_app --factory --reload
-
-# Run the full runtime (scheduler + delivery + optional gated LLM)
-python -m cadence.runtime
 ```
 
-Configuration is environment-based (prefix `CADENCE_`, optional `.env`) — see
-`cadence/config.py` for every setting (storage-tier paths, the `nas_root` trust boundary,
-`env` for prod fail-closed gates, governor mode, delivery provider, LLM on/off + provider,
-mTLS). All paths default to relative `var/` locations and are overridable; no absolute or
-personal paths are baked in.
+Configuration is environment-based (prefix `CADENCE_`, optional `.env` file) — see `cadence/config.py` for every setting (storage-tier paths, the `nas_root` trust boundary, `env` for prod fail-closed gates, Cloudflare replica placeholders, vault master key, `require_mtls`, Daglo placeholder, raw-boundary length limits).
 
-The device agents live under `agents/` (`core` = Rust, `android` = JNI, `windows` =
-net8.0); each has its own README. The Rust core builds with `cargo build`; the Android and
-Windows agents build on their respective platforms (the Windows agent requires a Windows
-toolchain — CI builds it on a Windows runner).
-
-## Continuous integration
-
-`.github/workflows/ci.yml` runs four jobs on every push/PR, with **every third-party
-action pinned to a full commit SHA** for supply-chain safety:
-
-- **Python** (Ubuntu) — `ruff check` + `pytest`
-- **Rust core** (Ubuntu) — `cargo fmt --check`, `clippy -D warnings`, `cargo test`
-- **Android** (Ubuntu) — installs the NDK, cross-compiles the core to per-ABI `jniLibs`,
-  runs `./gradlew assembleDebug`, uploads the APK
-- **Windows agent** (Windows) — builds and publishes the net8.0 agent (the only place
-  WPF/UI-Automation builds) and uploads it as an artifact
-
-## Architecture (the built spine)
-
-```mermaid
-flowchart TD
-    SRC[Source Adapters] -->|"Event · structured, never raw"| ING[Ingestion API]
-    ING --> FG[FactGraph]
-    ING --> PROJ[Projection]
-    ING --> DL[Deadline Extractor]
-    FG --> D1
-    PROJ --> D1
-    DL --> D1
-    D1[(D1 · local-canonical SQLite)]
-    D1 -->|"async · boundary re-checked"| REP[(Cloudflare D1 replica)]
-    D1 -->|"id / hash"| NAS[(NAS · raw evidence)]
-    NAS -->|"derived only"| R2[(R2 · derived blobs)]
-    D1 --> ENG[Engine loop] -->|"nudge"| DLV[Delivery]
-
-    classDef store fill:#e8ecff,stroke:#5566aa,color:#111a33;
-    class D1,REP,NAS,R2 store;
-```
-
-**Source Adapters** (GitHub · Google Calendar · Email · devbox · device agents) `fetch → normalize → emit` provenance-tagged Events — structured fields plus a NAS pointer, never raw. **Ingestion** (FastAPI, mTLS, fail-closed) WAL-buffers and dedupes, then fans out to the **FactGraph**, the typed-row **Projection** (`calendar_event`/`task`), and the **Deadline Extractor** (rule-based, optional LLM hook). All land in **D1**, the local-canonical SQLite store — every write passes the structural `SchemaBoundary` + `PayloadClassifier`, so no verbatim content is stored. D1 replicates structured rows off-site to **Cloudflare D1**; raw evidence lives only in **NAS** (content-addressed), and derived blobs go to **R2**. The **Engine loop** (AttentionState → priority + misallocation → Nudge Governor, shadow/live) drives **Delivery**.
-
-**Invariants** (full list in `AGENTS.md`): hot-path reads/writes hit local SQLite, never
-the cloud replica; D1/R2/replica hold structured/derived only — raw lives solely in NAS by
-opaque reference, enforced by the structural allowlist; credentials live only in the
-NAS-only vault, boundary-checked against `nas_root`; every raw-content egress goes through
-one of two logged channels; the mTLS ingest gate fails closed; the engine defaults to
-shadow mode.
-
-## Repository layout
+## Architecture (built spine)
 
 ```
-cadence/        the brain — adapters, stores, ingest, brain, engine, llm, runtime, onboarding, obs
-agents/         device agents — core (Rust), android (JNI), windows (net8.0)
-contract/       the device↔brain wire contract (event envelope schema + protocol)
-alembic/        the frozen D1 schema migration
-tests/          the Python test suite (404 tests)
-.github/        CI (SHA-pinned)
-AGENTS.md       architecture rationale + the system invariants
+ ┌───────────────── Source Adapters (per-account) ─────────────────┐
+ │  Adapter ABC: fetch() → normalize() → emit()                     │
+ │  GitHub · Google Calendar · Email  (fixtures-based, no live call) │
+ │  common Event schema (provenance-tagged) + AcquisitionTier       │
+ │  CredentialVault (NAS-only, encrypted-at-rest, nas_root-checked) │
+ └───────────────────────────┬───────────────────────────────────────┘
+                              │ Event (structured + NAS pointer, never raw)
+ ┌────────────────────────────▼──────────────────────────────────────┐
+ │ Ingestion (FastAPI POST /ingest/event, mTLS-checked, fail-closed)  │
+ │   WALBuffer (backpressure) → dedupe_id → … (serialized per-event)  │
+ └───────────┬───────────────────┬─────────────────────┬─────────────┘
+             │                   │                      │
+     ┌───────▼────────┐  ┌───────▼─────────┐  ┌──────────▼────────────┐
+     │  FactGraph      │  │  Projection      │  │ RuleDeadlineExtractor │
+     │  (assert_fact,  │  │  (typed rows:    │  │ (explicit + inferred, │
+     │   dedup+merge)  │  │  calendar_event, │  │  no LLM; reconciled)  │
+     │                 │  │  task)           │  │                       │
+     └───────┬─────────┘  └────────┬─────────┘  └───────────┬───────────┘
+             │ fact row            │ typed rows              │ deadline rows
+             ▼                     ▼                         ▼
+ ┌──────────────────────────── D1 (LOCAL-CANONICAL SQLite) ─────────────────────────┐
+ │ calendar_event · task · deadline · person · place · source_account ·             │
+ │ fact · nudge · feedback · sync_session                                           │
+ │ Every write passes SchemaBoundary (structural per-table column allowlist) +      │
+ │ PayloadClassifier (heuristic backstop) — no verbatim content, ever.              │
+ └───────────────────┬───────────────────────────────────────┬──────────────────────┘
+                      │ async enqueue (boundary re-checked)      │ raw_evidence_id/hash
+             ┌────────▼─────────────┐                 ┌─────────▼─────────┐
+             │ Cloudflare D1 replica│                 │      NAS          │
+             │ (STUB — in-memory    │                 │ (raw evidence,    │
+             │  queue, no HTTP)     │                 │  content-addressed│
+             └───────────────────────┘                │  local blob dir)  │
+                                                        └─────────┬─────────┘
+                                                                  │ derived blobs only
+                                                        ┌─────────▼─────────┐
+                                                        │        R2         │
+                                                        │ (derived blobs —  │
+                                                        │  stub local dir)  │
+                                                        └────────────────────┘
+
+ Observability: alarm sink (raw_to_cloud_violation · credential_vault_access ·
+ replication_queue_depth) + raw-content egress log, two sanctioned channels:
+   llm_text     — raw text to the user-configured LLM provider
+   daglo_audio  — raw audio to Daglo STT (interface-only in M1; no live call)
 ```
 
-## License
-
-Licensed under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later)
-— see [`LICENSE`](LICENSE). The AGPL's network-use clause matters for a self-hosted service
-like this: if you run a modified version and let others interact with it over a network,
-you must offer them the corresponding source.
+**Invariants this diagram encodes** (see `AGENTS.md` for the full list): all hot-path reads/writes hit the local SQLite D1, never the cloud replica; D1 and R2 hold structured/derived data only — raw evidence lives solely in NAS, referenced by opaque id/hash, enforced by the structural `SchemaBoundary` allowlist; credentials live only in the NAS-only vault, positively boundary-checked against `nas_root`; every raw-content egress goes through one of exactly two logged channels; the mTLS ingest gate fails closed by default.

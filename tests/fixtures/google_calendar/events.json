@@ -1,0 +1,35 @@
+[
+  {
+    "id": "evt_1",
+    "calendar_id": "primary",
+    "summary": "Team sync",
+    "description": "Agenda: review Q3 roadmap, discuss the rate-limiting PR, and assign the login-bug fix. Bring the burndown chart from the sprint board.",
+    "start": "2026-07-08T15:00:00Z",
+    "end": "2026-07-08T15:30:00Z",
+    "all_day": false,
+    "status": "confirmed",
+    "location": "Zoom",
+    "organizer": "alice@example.com",
+    "attendees": [
+      {"email": "alice@example.com", "response_status": "accepted"},
+      {"email": "bob@example.com", "response_status": "needsAction"}
+    ]
+  },
+  {
+    "id": "evt_2",
+    "calendar_id": "primary",
+    "summary": "Company offsite",
+    "description": "All-day offsite at the downtown venue. Verbatim itinerary and travel reimbursement instructions are in the linked doc.",
+    "start": "2026-07-20",
+    "end": "2026-07-21",
+    "all_day": true,
+    "status": "confirmed",
+    "location": "Downtown Conference Center",
+    "organizer": "alice@example.com",
+    "attendees": [
+      {"email": "alice@example.com", "response_status": "accepted"},
+      {"email": "bob@example.com", "response_status": "accepted"},
+      {"email": "carol@example.com", "response_status": "tentative"}
+    ]
+  }
+]

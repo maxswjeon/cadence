@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+env/
+
+# Cadence local runtime data (never committed; contains local-canonical + raw evidence stubs)
+*.sqlite
+*.sqlite3
+*.db
+var/
+data/
+/nas_blobs/
+/r2_blobs/
+/vault/
+
+# OMC / OMX operational state (already ignored by convention)
+# Design record (.omc/plans, .omc/specs, .omc/research) IS committed intentionally.
+.omc/state/
+.omc/logs/
+.omc/artifacts/
+.omc/sessions/
+.omc/handoffs/
+.omx/
+.remember/
+
+# Editor
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,24 @@
+[
+  {
+    "message_id": "msg-100",
+    "thread_id": "thread-1",
+    "from": "manager@example.com",
+    "to": ["me@example.com"],
+    "subject": "Please review the Q3 budget by Friday",
+    "body": "Hi team, please review the attached Q3 budget spreadsheet and send me your line-item comments before end of day Friday. We present to finance on Monday.",
+    "received_at": "2026-07-04T09:15:00Z",
+    "labels": ["inbox", "important"],
+    "has_attachment": true
+  },
+  {
+    "message_id": "msg-101",
+    "thread_id": "thread-2",
+    "from": "newsletter@example.com",
+    "to": ["me@example.com"],
+    "subject": "This week in engineering",
+    "body": "Verbatim newsletter body with links and summaries of last week's merged PRs across the org.",
+    "received_at": "2026-07-04T11:00:00Z",
+    "labels": ["inbox"],
+    "has_attachment": false
+  }
+]
