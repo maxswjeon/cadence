@@ -11,8 +11,9 @@ namespace Cadence.WindowsAgent.Wal;
 /// restart — lives ONCE in the Rust core (agents/core, W2), not here. This interface exists so
 /// collectors have a single, testable seam to append to (<see cref="AppendAsync"/>) without
 /// depending on <c>CoreInterop</c>'s P/Invoke surface directly; a production implementation is
-/// expected to be a thin wrapper that calls <c>CoreInterop.CadenceCoreSubmitEvent</c> and turns
-/// its <c>CoreSubmitResult</c> into this interface's <see cref="WalAppendResult"/>. A second,
+/// expected to be a thin wrapper that calls <c>CoreInterop.CadenceCoreCapture</c> and turns
+/// its <c>CadenceStatus</c> (Ok/QueueFull/InvalidArg/Error) into this interface's
+/// <see cref="WalAppendResult"/>. A second,
 /// purely-local implementation (e.g. backed by SQLite via Microsoft.Data.Sqlite, or a simple
 /// append-only file) is a reasonable interim/offline-buffer stub if the core FFI is not wired
 /// up yet — either way it must never lose an event that Append reported as accepted.

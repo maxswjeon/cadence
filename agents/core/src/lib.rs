@@ -19,12 +19,21 @@
 //!
 //! See `README.md` for the FFI-binding intent and the full property list the tests prove.
 
-#![forbid(unsafe_code)]
+// The crate is `unsafe`-free everywhere except the FFI boundary (`ffi.rs`, `jni.rs`), which
+// must dereference raw pointers and export `#[no_mangle]` symbols. Rust's `forbid` level is
+// deliberately un-overridable, so a crate-wide `#![forbid(unsafe_code)]` cannot grant those
+// two modules a scoped exception (E0453). `deny` gives the identical guarantee — any
+// unmarked `unsafe` anywhere is a hard compile error — while letting `ffi`/`jni` opt in via a
+// module-level `#[allow(unsafe_code)]` with a `// SAFETY:` on every block.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod agent;
 pub mod envelope;
 pub mod error;
+pub mod ffi;
+#[cfg(feature = "jni")]
+pub mod jni;
 pub mod source;
 pub mod transport;
 pub mod wal;

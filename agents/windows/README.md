@@ -41,8 +41,8 @@ agents/windows/
     NativeMethods.cs           Win32 P/Invoke declarations (User32: GetForegroundWindow,
                                GetWindowTextW, GetWindowThreadProcessId, SetWinEventHook,
                                UnhookWinEvent)
-    CoreInterop.cs              P/Invoke stub to the shared Rust cadence-agent-core (agents/core,
-                               W2) — SPECULATIVE, see below
+    CoreInterop.cs              P/Invoke bindings to the shared Rust cadence-agent-core
+                               (agents/core, W2) — reconciled 1:1 to its C ABI, see below
   Wal/
     IEventWal.cs                local WAL interface every collector writes through
     InMemoryEventWal.cs         NOT-FOR-PRODUCTION placeholder implementation (no durability)
@@ -62,14 +62,16 @@ agents/windows/
 ## Architecture dependency (not yet landed)
 
 Per the milestone-2 plan's architecture note, the security-critical device logic (persistent
-WAL, dedupe IDs, backpressure, mTLS transport with replay) is meant to be built ONCE as a
-portable Rust core (`agents/core/`, workstream W2) that this agent binds to via P/Invoke. **W2
-had not landed in this repo when this skeleton was written** — there is no cdylib and no
-published `extern "C"` export list. `Interop/CoreInterop.cs` is therefore a **speculative**
-placeholder ABI (function names, calling convention, and a JSON-string wire format are all
-best-guess), clearly marked with `TODO(contract)`. Once W2 ships, `CoreInterop.cs` needs to be
-reconciled against the real crate surface, and `Wal/InMemoryEventWal.cs` (also a
-not-for-production placeholder) should be replaced by a thin wrapper over it.
+WAL, dedupe IDs, backpressure, mTLS transport with replay) is built ONCE as a portable Rust
+core (`agents/core/`, workstream W2) that this agent binds to via P/Invoke. **W2 has since
+landed with a canonical C ABI** (`agents/core/include/cadence_agent_core.h`, exported from
+`agents/core/src/ffi.rs`), and `Interop/CoreInterop.cs` is now reconciled 1:1 against it: the
+opaque `CadenceCore*` handle model (`nint`), `cadence_core_init/capture/pending_len/is_full/
+drain/compact/shutdown/last_error/version` + `cadence_string_free`, the `CadenceStatus`
+{Ok,QueueFull,InvalidArg,Error} enum, the capture-vs-drain split, and caller-frees-strings
+ownership. What remains is a `TODO(device)` packaging step — building the `cadence_agent_core`
+cdylib per platform and shipping it beside the agent — and replacing `Wal/InMemoryEventWal.cs`
+(a not-for-production placeholder) with a thin wrapper over `CoreInterop`.
 
 `Models/EventEnvelope.cs` and `Models/AcquisitionTier.cs` were originally built directly
 against the brain's Python `Event`/`AcquisitionTier` (`cadence/adapters/base.py`) because

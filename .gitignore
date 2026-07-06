@@ -50,3 +50,8 @@ target/
 **/.omc/artifacts/
 **/.omc/logs/
 **/.omc/handoffs/
+
+# OMC project memory (runtime)
+.omc/project-memory.json
+.omc/notepad.md
+.omc/project-memory.json

@@ -49,6 +49,19 @@ pub trait Transport {
     fn send(&self, envelope: &EventEnvelope) -> Outcome;
 }
 
+/// Delegating impl so a boxed (including `dyn`) transport is itself a [`Transport`].
+///
+/// This is what lets the FFI layer hold an `AgentCore<Box<dyn Transport>>` — a single
+/// concrete `AgentCore` type whose transport is chosen at runtime (real [`HttpsTransport`]
+/// in production, [`MockTransport`] when the FFI unit tests inject one). The bound is
+/// `?Sized` so `Box<dyn Transport>` qualifies; the trait itself stays object-safe (`send`
+/// takes `&self` and uses no generics), so `dyn Transport` remains a valid type.
+impl<T: Transport + ?Sized> Transport for Box<T> {
+    fn send(&self, envelope: &EventEnvelope) -> Outcome {
+        (**self).send(envelope)
+    }
+}
+
 // --------------------------------------------------------------------------- //
 // MockTransport
 // --------------------------------------------------------------------------- //

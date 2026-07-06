@@ -3,68 +3,122 @@ package com.cadence.agent.core
 /**
  * JNI binding surface to the Rust `cadence-agent-core` crate (`agents/core`, W2) — the
  * portable, load-bearing implementation of envelope dedupe, persistent crash-safe WAL,
- * bounded-queue backpressure, retry/backoff, and (once its `https` feature is exercised
- * outside tests) the mTLS transport client. See the architecture note in
- * `.omc/plans/cadence-milestone-2-device-agents.md`: the hard device logic is built ONCE
- * in Rust and bound via JNI (Android, here) / P-Invoke (Windows,
+ * bounded-queue backpressure, retry/backoff, and the mTLS transport client. See the
+ * architecture note in `.omc/plans/cadence-milestone-2-device-agents.md`: the hard device
+ * logic is built ONCE in Rust and bound via JNI (Android, here) / P-Invoke (Windows,
  * `agents/windows/Interop/CoreInterop.cs`).
  *
- * ## Honest status (verified against the real crate — not guessed)
- * `agents/core` is real and load-bearing: it builds, and exposes a genuine public Rust
- * API in `agents/core/src/agent.rs` —
- * `AgentCore::capture` / `capture_from` / `pending_len` / `is_full` / `dead_letter` /
- * `drain` / `compact` — backed by its own durable WAL (`agents/core/src/wal.rs`) and a
- * `Transport` trait with retry/backoff (`agents/core/src/agent.rs::RetryPolicy`).
- * `Cargo.toml` already emits a `cdylib` (`crate-type = ["rlib", "cdylib"]`), so FFI
- * linking is possible in principle. **But there is no `#[no_mangle] extern "C"` export
- * layer yet** — a repo-wide grep for `no_mangle`/`extern "C"` under `agents/core/src`
- * finds nothing, so there is no real JNI symbol table to bind against yet, and no
- * compiled `.so` is packaged under `app/src/main/jniLibs/`.
+ * ## Contract (reconciled against the real crate)
+ * W2 exports a JNI layer (`agents/core/src/jni.rs`, behind the crate's `jni` cargo feature)
+ * whose `Java_com_cadence_agent_core_CoreBridge_native*` symbols this class's `external fun`s
+ * resolve to. That layer contains no core logic — it delegates into the same handle functions
+ * as the canonical C ABI (`agents/core/src/ffi.rs`).
  *
- * Every `external fun` below is this skeleton's best-effort mapping of the *real* Rust
- * API above onto a plausible JNI surface — not a confirmed contract. TODO(contract):
- * once a follow-up to W2 publishes
- * `#[no_mangle] extern "C" fn Java_com_cadence_agent_core_CoreBridge_...` exports,
- * reconcile every signature/name here against them (including how a Rust
- * `Result<_, AgentError>` crosses the JNI boundary — sentinel return, out-param, or a
- * thrown Java exception convention is still an open question) and delete this notice.
- * Calling any of these before that `.so` is linked throws `UnsatisfiedLinkError`.
+ * ### Handle model
+ * [nativeInit] heap-allocates an opaque core and returns it as a [Long] handle (0 on failure;
+ * the detail is readable via [nativeLastError]). Every other native call takes that handle;
+ * [nativeShutdown] compacts and frees it. This bridge holds the single live [handle].
+ *
+ * ### Error convention
+ * A Rust `Result<_, AgentError>` crosses the boundary as a thrown exception:
+ *  - `AgentError::QueueFull` → [BackpressureException] (the bounded WAL is full; the caller
+ *    must pause capture — this mirrors the brain's 503).
+ *  - any other failure → [CoreException].
+ * [nativeInit] is the one exception: it returns 0 rather than throwing, so callers check the
+ * handle and read [nativeLastError].
+ *
+ * TODO(device): [System.loadLibrary] resolves `libcadence_agent_core.so`, which must be built
+ * (`cargo build --release --features jni` per Android ABI) and packaged under
+ * `app/src/main/jniLibs/<abi>/` — see the `externalNativeBuild`/jniLibs TODO in
+ * `app/build.gradle.kts`. Until that `.so` is packaged, the `init` block throws
+ * `UnsatisfiedLinkError` at class load.
  *
  * JNI naming convention reference:
  * https://docs.oracle.com/en/java/javase/17/docs/specs/jni/design.html#resolving-native-method-names
  */
 object CoreBridge {
+    /** Opaque pointer to the Rust `CadenceCore`, or 0 when not initialized. */
+    private var handle: Long = 0
+
     init {
-        // TODO(device): System.loadLibrary("cadence_agent_core") once a real .so with an
-        // extern "C" export layer is packaged under app/src/main/jniLibs/<abi>/ — see the
-        // externalNativeBuild TODO in app/build.gradle.kts.
+        System.loadLibrary("cadence_agent_core")
+    }
+
+    /**
+     * Opens/creates the WAL and builds the mTLS transport from a UTF-8 JSON config (wal_path,
+     * capacity, base_url, client_identity_pem, ca_pem, optional
+     * retry{base_ms,max_ms,max_attempts}), storing the resulting [handle].
+     *
+     * @throws CoreException if the core could not be initialized (see [nativeLastError]).
+     */
+    fun init(configJson: String) {
+        val h = nativeInit(configJson)
+        if (h == 0L) {
+            throw CoreException(nativeLastError() ?: "cadence_core_init failed")
+        }
+        handle = h
     }
 
     /**
      * Durably appends one JSON-encoded [com.cadence.agent.envelope.EventEnvelope] to the
-     * core's WAL, mirroring `AgentCore::capture`. Returns the envelope's `dedupe_id` on
-     * success. TODO(contract): the real Rust signature returns
-     * `Result<String, AgentError>` (`AgentError::QueueFull` when the bounded WAL is
-     * full, mapping to backpressure on the caller — see [isFull]) — unresolved how that
-     * crosses the JNI boundary until W2 exports it (see class doc).
+     * core's WAL, returning the envelope's `dedupe_id`.
+     *
+     * @throws BackpressureException when the bounded WAL is full (caller must pause capture).
+     * @throws CoreException on any other failure (e.g. malformed envelope JSON).
      */
-    external fun capture(envelopeJson: String): String
+    fun capture(envelopeJson: String): String = nativeCapture(handle, envelopeJson)
 
-    /** Mirrors `AgentCore::pending_len` — count of un-acked events buffered in the WAL. */
-    external fun pendingLen(): Long
+    /** Count of un-acked events buffered in the WAL. */
+    fun pendingLen(): Long = nativePendingLen(handle)
 
-    /** Mirrors `AgentCore::is_full` — true when the bounded WAL is full; caller must pause capture. */
-    external fun isFull(): Boolean
+    /** True when the bounded WAL is full; the caller must pause capture. */
+    fun isFull(): Boolean = nativeIsFull(handle)
 
     /**
-     * Mirrors `AgentCore::drain` — attempts delivery of all pending events oldest-first
-     * against the brain (`POST /ingest/event`), retrying `503`/network failures with
-     * capped backoff (`RetryPolicy`). Returns a JSON-encoded `DrainReport` (`delivered`,
-     * `dead_lettered`, `backpressure_hits`, `network_errors`, `pending_after`, `stop` —
-     * see `agents/core/src/agent.rs::DrainReport`).
+     * Attempts delivery of all pending events oldest-first against the brain
+     * (`POST /ingest/event`), retrying `503`/network failures with capped backoff. Returns a
+     * JSON-encoded `DrainReport` (`delivered`, `dead_lettered`, `backpressure_hits`,
+     * `network_errors`, `pending_after`, `stop`).
+     *
+     * @throws CoreException if the drain pass could not run.
      */
-    external fun drain(): String
+    fun drain(): String = nativeDrain(handle)
 
-    /** Mirrors `AgentCore::compact` — forces a WAL rewrite holding only live pending events. */
-    external fun compact(): Unit
+    /** Forces a WAL rewrite holding only live pending events. */
+    fun compact() = nativeCompact(handle)
+
+    /** Compacts and frees the native handle. Idempotent. */
+    fun shutdown() {
+        if (handle != 0L) {
+            nativeShutdown(handle)
+            handle = 0
+        }
+    }
+
+    // --- native declarations (resolve to Java_com_cadence_agent_core_CoreBridge_native* in
+    //     agents/core/src/jni.rs) --------------------------------------------------------- //
+
+    private external fun nativeInit(configJson: String): Long
+    private external fun nativeCapture(handle: Long, envelopeJson: String): String
+    private external fun nativePendingLen(handle: Long): Long
+    private external fun nativeIsFull(handle: Long): Boolean
+    private external fun nativeDrain(handle: Long): String
+    private external fun nativeCompact(handle: Long)
+    private external fun nativeShutdown(handle: Long)
+
+    /** The thread-local last-error JSON (`{code,message}`) from the native core, or null. */
+    external fun nativeLastError(): String?
 }
+
+/**
+ * Thrown by [CoreBridge.capture] when the core's bounded WAL is full — backpressure. The
+ * caller must stop pulling from its capture source until a [CoreBridge.drain] frees space.
+ * Maps to the Rust `AgentError::QueueFull` (mirrors, but is distinct from, the brain's 503).
+ */
+class BackpressureException(message: String) : RuntimeException(message)
+
+/**
+ * Thrown when a native `cadence-agent-core` call fails for any reason other than backpressure
+ * (maps to any non-`QueueFull` `AgentError`, a parse error, or a caught panic).
+ */
+class CoreException(message: String) : RuntimeException(message)
