@@ -1,25 +1,33 @@
-"""NAS-only credential vault (encrypted-at-rest STUB).
+"""NAS-only credential vault (authenticated-encryption at rest).
 
 Concrete :class:`~cadence.adapters.base.CredentialVault` that stores per-account
 secrets as encrypted files **on the local NAS directory only** — never D1, never R2,
 never LLM egress. Secrets are per-account scoped and individually revocable; every
 access fires the ``credential_vault_access`` alarm.
 
-.. warning::
-   The encryption here is a **stub** (a SHA-256 keystream XOR), adequate for M1's
-   no-live-creds testing. Production must use a real KMS/HW keystore (age/sops or an
-   OS keychain). It is intentionally *not* production-grade crypto.
+Records are sealed with **AES-256-GCM** (v2 envelope). The 32-byte AES key is derived
+from ``settings.vault_master_key`` via **HKDF-SHA256**; every write uses a fresh random
+96-bit nonce, and the record's slot ``(provider, account_ref)`` is bound as AAD so a
+ciphertext copied into another slot fails to decrypt. Only the v2 envelope is accepted:
+the historical v1 stub (an unauthenticated-slot SHA-256-keystream-XOR record) was
+dev-only and is now **rejected** on read rather than migrated — reading it would reopen a
+slot-relocation downgrade, and no real v1 vaults exist to migrate.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
-import hmac
 import json
 import os
 import threading
 from pathlib import Path
 from typing import Any
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from cadence.adapters.base import CredentialVault
 from cadence.config import DEFAULT_VAULT_MASTER_KEY, Settings, get_settings
@@ -32,25 +40,21 @@ _FORBIDDEN_CLOUD_MARKERS = ("r2_blobs", "d1.sqlite")
 
 #: Providers whose secrets are *real, minted* live credentials (OAuth tokens / API keys)
 #: rather than M1 placeholders. Persisting one of these under the publicly-known
-#: DEFAULT_VAULT_MASTER_KEY is refused in **every** env (not just prod): the stub cipher
-#: with a checked-in key offers no protection, so a real ChatGPT-OAuth / API-key login
-#: must set CADENCE_VAULT_MASTER_KEY first. (Placeholder providers stay allowed in dev.)
+#: DEFAULT_VAULT_MASTER_KEY is refused in **every** env (not just prod): a checked-in key
+#: derives a publicly-known AES key, so a real ChatGPT-OAuth / API-key login must set
+#: CADENCE_VAULT_MASTER_KEY first. (Placeholder providers stay allowed in dev.)
 _LIVE_CRED_PROVIDERS = frozenset({"chatgpt_oauth", "openai_api"})
 
+#: HKDF ``info`` (domain-separation label) for the v2 AES-256-GCM key.
+_HKDF_INFO = b"cadence-vault-v2"
 
-def _keystream(key: bytes, salt: bytes, n: int) -> bytes:
-    """Deterministic SHA-256 keystream (STUB cipher, not for production)."""
-    out = bytearray()
-    counter = 0
-    while len(out) < n:
-        block = hashlib.sha256(key + salt + counter.to_bytes(8, "big")).digest()
-        out.extend(block)
-        counter += 1
-    return bytes(out[:n])
+#: Current on-disk envelope version and AEAD identifier.
+_ENVELOPE_VERSION = 2
+_ENVELOPE_ALG = "AES-256-GCM"
 
 
 class FileCredentialVault(CredentialVault):
-    """File-backed, NAS-only credential vault (encrypted-at-rest stub)."""
+    """File-backed, NAS-only credential vault (AES-256-GCM authenticated encryption)."""
 
     def __init__(self, settings: Settings | None = None, *, base_dir: Path | None = None) -> None:
         self._settings = settings or get_settings()
@@ -65,7 +69,10 @@ class FileCredentialVault(CredentialVault):
         self._assert_not_cloud(self.base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.base_dir, 0o700)
-        self._master_key = self._settings.vault_master_key.encode("utf-8")
+        # The v2 AES key is an HKDF-derived subkey, so the raw master key is never used
+        # directly as the cipher key.
+        master_key = self._settings.vault_master_key.encode("utf-8")
+        self._aead = AESGCM(self._derive_key(master_key))
         # Guards store/revoke read-modify-write of the sidecar index against
         # concurrent callers; cred/index files themselves are written atomically
         # (temp file + os.replace) so a torn write can never corrupt them.
@@ -110,24 +117,65 @@ class FileCredentialVault(CredentialVault):
     def _path(self, provider: str, account_ref: str) -> Path:
         return self.base_dir / f"{self._slug(provider, account_ref)}.cred"
 
-    # -- crypto (stub) ------------------------------------------------------ #
+    # -- crypto (AES-256-GCM, v2 envelope) ---------------------------------- #
 
-    def _encrypt(self, plaintext: bytes) -> bytes:
-        # Random per write — a deterministic (plaintext-derived) salt would make
-        # identical secrets produce identical ciphertext, leaking equality.
-        salt = os.urandom(16)
-        ks = _keystream(self._master_key, salt, len(plaintext))
-        ct = bytes(a ^ b for a, b in zip(plaintext, ks, strict=True))
-        mac = hmac.new(self._master_key, salt + ct, hashlib.sha256).digest()
-        return salt + mac + ct
+    @staticmethod
+    def _derive_key(master_key: bytes) -> bytes:
+        """Derive the 32-byte AES-256 key from the master key via HKDF-SHA256."""
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=_HKDF_INFO)
+        return hkdf.derive(master_key)
 
-    def _decrypt(self, blob: bytes) -> bytes:
-        salt, mac, ct = blob[:16], blob[16:48], blob[48:]
-        expected = hmac.new(self._master_key, salt + ct, hashlib.sha256).digest()
-        if not hmac.compare_digest(mac, expected):
-            raise ValueError("vault entry failed integrity check (wrong key or tampered)")
-        ks = _keystream(self._master_key, salt, len(ct))
-        return bytes(a ^ b for a, b in zip(ct, ks, strict=True))
+    @staticmethod
+    def _aad(provider: str, account_ref: str) -> bytes:
+        """Additional authenticated data binding a ciphertext to its slot.
+
+        Uses an **injective** JSON encoding rather than ``f"{provider}:{account_ref}"``:
+        a plain ``:`` join collides — ``("a", "b:c")`` and ``("a:b", "c")`` would map to
+        the same AAD, letting a ciphertext be opened under a different slot. JSON escaping
+        of the two elements makes the encoding unambiguous.
+        """
+        return json.dumps([provider, account_ref], separators=(",", ":")).encode("utf-8")
+
+    def _encrypt(self, plaintext: bytes, provider: str, account_ref: str) -> bytes:
+        """Seal ``plaintext`` into a versioned JSON envelope (bytes) for the given slot."""
+        nonce = os.urandom(12)  # 96-bit random nonce, one per record write
+        ct = self._aead.encrypt(nonce, plaintext, self._aad(provider, account_ref))
+        envelope = {
+            "v": _ENVELOPE_VERSION,
+            "alg": _ENVELOPE_ALG,
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "ct": base64.b64encode(ct).decode("ascii"),
+        }
+        return json.dumps(envelope).encode("utf-8")
+
+    @staticmethod
+    def _parse_v2_envelope(blob: bytes) -> dict[str, Any] | None:
+        """Return the parsed v2 envelope, or ``None`` if ``blob`` is a legacy v1 record.
+
+        Legacy v1 records are raw ``salt+mac+ct`` bytes, which almost never decode as
+        the JSON object a v2 envelope is, so a failed/foreign parse means "treat as v1".
+        """
+        try:
+            obj = json.loads(blob)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if isinstance(obj, dict) and obj.get("v") == _ENVELOPE_VERSION:
+            return obj
+        return None
+
+    def _decrypt_v2(self, envelope: dict[str, Any], provider: str, account_ref: str) -> bytes:
+        """Open a v2 AES-256-GCM envelope; raise on tamper / wrong key / wrong slot."""
+        try:
+            nonce = base64.b64decode(envelope["nonce"])
+            ct = base64.b64decode(envelope["ct"])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValueError("vault entry is malformed (corrupt envelope)") from exc
+        try:
+            return self._aead.decrypt(nonce, ct, self._aad(provider, account_ref))
+        except InvalidTag as exc:
+            raise ValueError(
+                "vault entry failed integrity check (wrong key, tampered, or wrong slot)"
+            ) from exc
 
     # -- atomic file I/O ------------------------------------------------------ #
 
@@ -158,7 +206,7 @@ class FileCredentialVault(CredentialVault):
         ):
             raise ValueError(
                 f"refusing to persist live '{provider}' credentials under the default "
-                "vault_master_key: the stub cipher's checked-in key protects nothing. "
+                "vault_master_key: a checked-in key derives a publicly-known AES key. "
                 "Set CADENCE_VAULT_MASTER_KEY to a real secret before authenticating."
             )
         get_alarm_sink().fire(
@@ -168,7 +216,9 @@ class FileCredentialVault(CredentialVault):
         path = self._path(provider, account_ref)
         self._assert_not_cloud(path)
         with self._lock:
-            self._atomic_write(path, self._encrypt(json.dumps(secret).encode("utf-8")))
+            self._atomic_write(
+                path, self._encrypt(json.dumps(secret).encode("utf-8"), provider, account_ref)
+            )
             self._update_index(provider, account_ref, add=True)
 
     def get(self, provider: str, account_ref: str) -> dict[str, Any]:
@@ -179,7 +229,19 @@ class FileCredentialVault(CredentialVault):
         path = self._path(provider, account_ref)
         if not path.exists():
             raise KeyError(f"no credential for {provider}/{account_ref}")
-        return json.loads(self._decrypt(path.read_bytes()).decode("utf-8"))
+        blob = path.read_bytes()
+        envelope = self._parse_v2_envelope(blob)
+        if envelope is None:
+            # Not a v2 envelope: a legacy v1 stub (or otherwise foreign) record. The v1
+            # stub authenticated only salt+ct, not the slot, so honoring it would let a
+            # blob be relocated into another slot's file and returned as that slot's
+            # secret. Reject rather than migrate — the v1 vault was dev-only.
+            raise ValueError(
+                "vault entry is not a v2 AES-256-GCM record; legacy/unrecognized formats "
+                "are rejected (re-onboard the credential to store it under the new cipher)"
+            )
+        plaintext = self._decrypt_v2(envelope, provider, account_ref)
+        return json.loads(plaintext.decode("utf-8"))
 
     def revoke(self, provider: str, account_ref: str) -> None:
         get_alarm_sink().fire(

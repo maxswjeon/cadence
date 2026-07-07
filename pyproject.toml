@@ -19,6 +19,9 @@ dependencies = [
     "alembic>=1.13",
     "httpx>=0.27",
     "uvicorn[standard]>=0.50.2",
+    # Authenticated encryption (AES-256-GCM) for the NAS credential vault; also the
+    # RSA JWT signer for live FCM push (the fcm extra reuses this core dependency).
+    "cryptography>=42",
 ]
 
 [project.scripts]
@@ -29,6 +32,8 @@ cadence = "cadence.cli:main"
 # Runtime feature extras (opt-in via `uv sync --extra fcm` / `pip install cadence[fcm]`).
 [project.optional-dependencies]
 # Live FCM push delivery (RSA JWT signer for the service-account access token).
+# cryptography is already a core dependency; kept here so the fcm extra stays
+# self-documenting about what it needs.
 fcm = [
     "cryptography>=42",
 ]
