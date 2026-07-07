@@ -1,0 +1,21 @@
+[Unit]
+Description=Cadence devbox source — content-free, own-user dev-server signals
+Documentation=https://github.com/maxswjeon/cadence
+After=network-online.target cadence-runtime.service
+Wants=network-online.target
+# Ordering only, not a hard dependency: the poller retries POSTs and tolerates the
+# runtime being briefly unavailable, so it need not fail if the API restarts.
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/state/cadence
+EnvironmentFile=%h/.config/cadence/cadence.env
+# Repo roots to scan for WIP/stale-branch signals (own-user only). %h = your home.
+Environment=CADENCE_DEVBOX_REPO_ROOTS=%h/projects
+ExecStart=%h/.local/share/cadence/venv/bin/cadence devbox
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

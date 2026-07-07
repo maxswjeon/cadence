@@ -54,6 +54,8 @@ def main() -> None:
         interval_seconds=config.interval_seconds,
         delivery_provider=config.delivery_provider,
         llm_enabled=deadline_hook is not None or receptiveness_hook is not None,
+        http_host=config.http_host,
+        http_port=config.http_port,
     )
     runtime.start()
     try:
@@ -73,7 +75,12 @@ def _serve(runtime: CadenceRuntime) -> None:
         )
         runtime.scheduler._stop.wait()  # noqa: SLF001 - block until stop() is signalled
         return
-    uvicorn.run(runtime.app, host="0.0.0.0", port=8000, log_config=None)  # noqa: S104
+    uvicorn.run(
+        runtime.app,
+        host=runtime.config.http_host,
+        port=runtime.config.http_port,
+        log_config=None,
+    )
 
 
 if __name__ == "__main__":

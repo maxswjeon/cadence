@@ -1,0 +1,20 @@
+[Unit]
+Description=Cadence runtime — ingest API + attention engine + nudge delivery
+Documentation=https://github.com/maxswjeon/cadence
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Data (SQLite D1, NAS/R2 blob dirs, credential vault) lands under var/ here.
+WorkingDirectory=%h/.local/state/cadence
+EnvironmentFile=%h/.config/cadence/cadence.env
+# The runtime self-initializes its SQLite schema on start — no migrate step needed.
+ExecStart=%h/.local/share/cadence/venv/bin/cadence runtime
+Restart=on-failure
+RestartSec=5
+# Hardening (a user service; capture is own-user by design — never run as root).
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

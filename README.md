@@ -63,28 +63,34 @@ The architecture rationale and the system invariants are documented in `AGENTS.m
 
 ## Quickstart (the brain)
 
-```bash
-pip install -e ".[dev]"
+Uses [`uv`](https://docs.astral.sh/uv/) for the environment:
 
-# Apply the D1 schema (creates var/d1.sqlite by default; see cadence/config.py).
-alembic upgrade head
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
 
 # Test + lint
 pytest
 ruff check .
 
-# Run the FastAPI brain (dev)
-uvicorn cadence.brain.app:create_app --factory --reload
+# Run the full runtime — ingest API + engine + delivery (schema self-initializes).
+# Serves on 127.0.0.1:3245 by default (0x0CAD; override with CADENCE_HTTP_PORT).
+CADENCE_REQUIRE_MTLS=false cadence runtime
 
-# Run the full runtime (scheduler + delivery + optional gated LLM)
-python -m cadence.runtime
+# Feed it this machine's live signals (in another shell)
+CADENCE_INGEST_URL=http://127.0.0.1:3245/ingest/event cadence devbox --once
 ```
 
+A single `cadence` command drives everything: `cadence runtime`, `cadence devbox`,
+`cadence onboarding`. To run the brain + devbox poller as **systemd** user services
+(via `uv`), see [`packaging/`](packaging/).
+
 Configuration is environment-based (prefix `CADENCE_`, optional `.env`) — see
-`cadence/config.py` for every setting (storage-tier paths, the `nas_root` trust boundary,
-`env` for prod fail-closed gates, governor mode, delivery provider, LLM on/off + provider,
-mTLS). All paths default to relative `var/` locations and are overridable; no absolute or
-personal paths are baked in.
+`cadence/config.py` and `RuntimeConfig` in `cadence/runtime/service.py` for every setting
+(HTTP host/port, storage-tier paths, the `nas_root` trust boundary, `env` for prod
+fail-closed gates, governor mode, delivery provider, LLM on/off + provider, mTLS). All
+paths default to relative `var/` locations and are overridable; no absolute or personal
+paths are baked in.
 
 The device agents live under `agents/` (`core` = Rust, `android` = JNI, `windows` =
 net8.0); each has its own README. The Rust core builds with `cargo build`; the Android and

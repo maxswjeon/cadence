@@ -59,6 +59,13 @@ class RuntimeConfig:
     fcm_project_id: str | None = None
     #: Comma-separated device tokens for the FCM provider (a runtime plug-in point).
     fcm_device_tokens: tuple[str, ...] = ()
+    #: HTTP bind address. Defaults to loopback — a TLS-terminating proxy (which sets the
+    #: mTLS client-cert header) is expected to face the network; set 0.0.0.0 to expose
+    #: the ingest API directly (dev/LAN only).
+    http_host: str = "127.0.0.1"
+    #: HTTP listen port. Default 3245 (0x0CAD — "Cadence"); a distinctive, uncommon port
+    #: that avoids the common 8000/8080 collisions and sits below the ephemeral range.
+    http_port: int = 3245
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -76,6 +83,8 @@ class RuntimeConfig:
             delivery_provider=env.get("CADENCE_DELIVERY_PROVIDER", "console"),
             fcm_project_id=env.get("CADENCE_FCM_PROJECT_ID") or None,
             fcm_device_tokens=tuple(t.strip() for t in tokens.split(",") if t.strip()),
+            http_host=env.get("CADENCE_HTTP_HOST", "127.0.0.1"),
+            http_port=_parse_port(env.get("CADENCE_HTTP_PORT", "3245")),
         )
 
 
@@ -91,6 +100,17 @@ def _parse_interval(raw: str) -> float:
         raise ValueError(
             f"CADENCE_TICK_INTERVAL_SECONDS must be a positive number, got {raw!r}"
         )
+    return value
+
+
+def _parse_port(raw: str) -> int:
+    """Parse ``CADENCE_HTTP_PORT`` into a valid TCP port (1-65535) or raise clearly."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"CADENCE_HTTP_PORT must be an integer 1-65535, got {raw!r}") from None
+    if not 1 <= value <= 65535:
+        raise ValueError(f"CADENCE_HTTP_PORT must be an integer 1-65535, got {raw!r}")
     return value
 
 
