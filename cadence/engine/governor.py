@@ -17,6 +17,16 @@ Decides whether a finding becomes a nudge. Design goals (per the M3 plan):
   :meth:`thanks_rate` and :meth:`recall_estimate` expose the precision/recall proxies.
 * **Device-care rule path.** :meth:`consider_device_care` is a *separate*, deterministic
   rule set over telemetry facts (low battery → a care nudge), not the inference path.
+* **S0.2 shadow→live gate — deadline-derived nudges only.** In ``live`` mode, a candidate
+  whose ``kind`` is in :attr:`GovernorConfig.deadline_derived_kinds` is persisted live only
+  when :func:`cadence.spikes.s0_2.thresholds.evaluate_go_no_go` reads ``"go"`` against the
+  report ``deadline_calibration_source`` supplies (see :meth:`deadline_go_no_go`);
+  ``no_go``/``insufficient_data`` — including the default, when no source is wired — keeps it
+  shadow. This scoping is deliberate: S0.2 only measures the deadline extractor's
+  classification accuracy (``CalibrationReport.priority_status`` is literally
+  ``PRIORITY_NOT_EVALUATED``), so misallocation/device-care nudges are **not** in scope and
+  stay governed by ``mode`` alone — exactly as before this gate existed. See
+  ``.omc/plans/cadence-production-hardening-plan.md`` A3.
 
 The LLM/receptiveness refinement is a documented **seam** (``receptiveness_hook``,
 default off), mirroring ``RuleDeadlineExtractor.llm_hook``.
@@ -38,11 +48,18 @@ from sqlalchemy.exc import IntegrityError
 from cadence.brain.facts import FactGraph, FactInput
 from cadence.engine.attention import AttentionSnapshot
 from cadence.engine.priority import Misallocation
+from cadence.spikes.s0_2.calibration import CalibrationReport
+from cadence.spikes.s0_2.thresholds import GoNoGoDecision, GoNoGoThresholds, evaluate_go_no_go
 from cadence.stores.d1 import D1Store
 from cadence.stores.models import Fact, Feedback, Nudge
 
 _MISALLOCATION = "attention.misallocation"
 _DEVICE_CARE = "device.care"
+#: Reserved for a future deadline-reminder nudge path -- no ``consider_*`` method emits
+#: this kind yet. Defined here (as the default of ``GovernorConfig.deadline_derived_kinds``)
+#: so the S0.2 gate is wired and testable ahead of that nudge path shipping, rather than
+#: silently open the day it does.
+_DEADLINE_REMINDER = "deadline.reminder"
 _INT_RE = re.compile(r"-?\d+")
 
 
@@ -74,6 +91,11 @@ class GovernorConfig:
     high_priority_gap: float = 0.4
     misalloc_priority_high: int = 2
     misalloc_priority_low: int = 1
+    #: Nudge kinds the S0.2 calibration gate governs (see module docstring "S0.2
+    #: shadow→live gate"). Must NEVER include ``_MISALLOCATION``/``_DEVICE_CARE`` (or any
+    #: other kind S0.2 doesn't measure) -- that would let a calibration of the deadline
+    #: extractor silently authorize live delivery of a nudge class it never evaluated.
+    deadline_derived_kinds: frozenset[str] = frozenset({_DEADLINE_REMINDER})
 
 
 @dataclass
@@ -113,6 +135,8 @@ class NudgeGovernor:
         config: GovernorConfig | None = None,
         facts: FactGraph | None = None,
         receptiveness_hook: Callable[[_Candidate, AttentionSnapshot | None], float] | None = None,
+        deadline_calibration_source: Callable[[], CalibrationReport | None] | None = None,
+        deadline_thresholds: GoNoGoThresholds | None = None,
     ) -> None:
         if mode not in ("live", "shadow"):
             raise ValueError(f"mode must be 'live' or 'shadow', got {mode!r}")
@@ -123,6 +147,16 @@ class NudgeGovernor:
         #: Documented seam: refine a candidate's confidence from receptiveness / a future
         #: LLM signal. ``None`` (default) leaves the rule confidence untouched.
         self.receptiveness_hook = receptiveness_hook
+        #: S0.2 gate data source: returns the current :class:`CalibrationReport` for the
+        #: deadline extractor (or ``None`` if no sample is available yet). ``None``
+        #: (default) means no data feed is wired -- production D1 has no gold-labeled
+        #: deadline sample table yet (gold labels are a one-time bootstrap JSON snapshot,
+        #: see ``cadence/spikes/s0_0/labeling.py``), so :meth:`deadline_go_no_go` then
+        #: always reads ``"insufficient_data"`` and deadline-derived nudges stay shadow.
+        #: Wiring a real feed is the remaining runtime step (see
+        #: ``.omc/plans/cadence-production-hardening-plan.md`` A3).
+        self.deadline_calibration_source = deadline_calibration_source
+        self.deadline_thresholds = deadline_thresholds or GoNoGoThresholds()
         # Serializes the in-memory threshold read-modify-write (and the feedback
         # idempotency check) so the scheduler thread (which reads thresholds inside
         # `_emit`) and the FastAPI feedback handler (a *different* threadpool thread that
@@ -243,6 +277,43 @@ class NudgeGovernor:
                     latest[device] = (f.created_at, level, charging, f.id)
         return [(dev, lvl, chg, fid) for dev, (_, lvl, chg, fid) in latest.items()]
 
+    # -- S0.2 shadow->live gate (deadline-derived nudges only) -------------- #
+
+    def deadline_go_no_go(self) -> GoNoGoDecision:
+        """S0.2 shadow→live verdict for deadline-derived nudges (see module docstring).
+
+        Refuses to fabricate a verdict when no :attr:`deadline_calibration_source` is
+        wired or it has nothing to report yet -- returns ``"insufficient_data"``, the
+        same honest default :func:`evaluate_go_no_go` itself falls back to below
+        ``min_shadow_events``.
+        """
+        if self.deadline_calibration_source is None:
+            return GoNoGoDecision(
+                verdict="insufficient_data", reasons=["no calibration data source wired"]
+            )
+        report = self.deadline_calibration_source()
+        if report is None:
+            return GoNoGoDecision(
+                verdict="insufficient_data", reasons=["calibration source returned no report"]
+            )
+        return evaluate_go_no_go(report, self.deadline_thresholds)
+
+    def _deliverable_live(self, kind: str) -> bool:
+        """Whether a firing candidate of ``kind`` may be persisted live under ``mode``.
+
+        Non-deadline-derived kinds (misallocation, device-care, ...) are governed by
+        ``mode`` alone -- unchanged from before this gate existed, since S0.2 doesn't
+        measure them (see module docstring). A kind in
+        :attr:`GovernorConfig.deadline_derived_kinds` additionally requires
+        :meth:`deadline_go_no_go` to read ``"go"``; ``no_go``/``insufficient_data`` keeps
+        it shadow even in live mode.
+        """
+        if self.mode != "live":
+            return False
+        if kind not in self.config.deadline_derived_kinds:
+            return True
+        return self.deadline_go_no_go().verdict == "go"
+
     # -- emission ----------------------------------------------------------- #
 
     def _emit(
@@ -280,7 +351,7 @@ class NudgeGovernor:
             fact_id=candidate.fact_id,
             source_event_ids=candidate.source_event_ids,
         )
-        if self.mode == "live":
+        if self._deliverable_live(candidate.kind):
             try:
                 proposed.nudge_id = self._persist(proposed, now)
             except IntegrityError:

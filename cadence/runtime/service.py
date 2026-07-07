@@ -11,6 +11,13 @@
 * optional, already-gated LLM hooks — a ``deadline_llm_hook`` wired into the ingest
   pipeline's :class:`~cadence.brain.deadlines.RuleDeadlineExtractor` and a
   ``receptiveness_hook`` wired into the governor — each attached **only when non-None**.
+* an optional ``deadline_calibration_source`` wired into the governor's S0.2 shadow→live
+  gate (:meth:`~cadence.engine.governor.NudgeGovernor.deadline_go_no_go`) for
+  deadline-derived nudges. ``None`` (default) means no data feed is wired — production D1
+  has no gold-labeled deadline sample table yet, so the gate always reads
+  ``"insufficient_data"`` and those nudges stay shadow even in ``live`` mode; wiring a real
+  feed (a D1-backed shadow-event/gold-label source) is the remaining runtime step (see
+  ``.omc/plans/cadence-production-hardening-plan.md`` A3).
 
 The LLM hooks are produced by the ``cadence.llm.factory`` (built by a sibling task); this
 module never enables inference on its own — it accepts whatever the factory hands it, which
@@ -39,6 +46,7 @@ from cadence.runtime.delivery import NudgeDelivery
 from cadence.runtime.delivery.console import ConsoleDelivery
 from cadence.runtime.delivery.mock import MockDelivery
 from cadence.runtime.scheduler import TickScheduler
+from cadence.spikes.s0_2.calibration import CalibrationReport
 from cadence.stores.d1 import D1Store
 
 _LOG = get_logger("runtime.service")
@@ -47,6 +55,9 @@ _LOG = get_logger("runtime.service")
 DeadlineLLMHook = Callable[[Event], list[DeadlineCandidate]]
 #: Type of the governor-side receptiveness hook (candidate, snapshot -> refined confidence).
 ReceptivenessHook = Callable[..., float]
+#: Type of the governor-side S0.2 gate data source (-> the current calibration report, or
+#: None if no sample is available yet).
+DeadlineCalibrationSource = Callable[[], CalibrationReport | None]
 
 
 @dataclass(frozen=True)
@@ -205,6 +216,7 @@ class CadenceRuntime:
         delivery: NudgeDelivery | None = None,
         deadline_llm_hook: DeadlineLLMHook | None = None,
         receptiveness_hook: ReceptivenessHook | None = None,
+        deadline_calibration_source: DeadlineCalibrationSource | None = None,
     ) -> None:
         self.config = config or RuntimeConfig()
         self.settings = settings or get_settings()
@@ -217,7 +229,10 @@ class CadenceRuntime:
         # One governor instance is shared by the engine (writes nudges) and the feedback
         # route (adjusts the very thresholds those nudges fired against).
         self.governor = NudgeGovernor(
-            store, mode=self.config.governor_mode, receptiveness_hook=receptiveness_hook
+            store,
+            mode=self.config.governor_mode,
+            receptiveness_hook=receptiveness_hook,
+            deadline_calibration_source=deadline_calibration_source,
         )
         self.engine = AttentionEngine(store, self.governor)
 

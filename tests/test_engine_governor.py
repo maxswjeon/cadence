@@ -7,14 +7,16 @@ from datetime import UTC, datetime, timedelta
 from _engine_util import battery, make_deadline, make_task
 
 from cadence.engine.attention import AttentionSnapshot, AttentionState
-from cadence.engine.governor import NudgeGovernor
+from cadence.engine.governor import NudgeGovernor, _Candidate  # noqa: SLF001 (test-only)
 from cadence.engine.priority import Misallocation, PriorityEngine, PriorityItem
 from cadence.obs.alarms import get_alarm_sink
+from cadence.spikes.s0_2.calibration import CalibrationReport, ClassCounts
 from cadence.stores.models import Feedback, Nudge
 
 NOW = datetime(2026, 7, 7, 15, 0, tzinfo=UTC)
 
 _MISALLOCATION = "attention.misallocation"
+_DEADLINE_REMINDER = "deadline.reminder"  # must match GovernorConfig.deadline_derived_kinds
 
 
 def _snapshot(target: str) -> AttentionSnapshot:
@@ -232,3 +234,137 @@ def test_threshold_update_is_atomic_under_concurrency(store) -> None:
         sys.setswitchinterval(prev_interval)
 
     assert gov.thresholds["k"] == float(n_threads * per_thread)
+
+
+# --- S0.2 shadow->live gate, deadline-derived nudges only (M7-A3) --------------- #
+
+
+def _deadline_candidate(basis_suffix: str) -> _Candidate:
+    return _Candidate(
+        kind=_DEADLINE_REMINDER,
+        confidence=0.99,
+        priority=1,
+        message_summary="A deadline is coming up.",
+        idempotency_basis=(_DEADLINE_REMINDER, basis_suffix),
+    )
+
+
+def _passing_calibration_report() -> CalibrationReport:
+    """A synthetic report that clears S0.2's default floors (n>=200, precision>=0.90,
+    recall>=0.70 on the evaluated classes)."""
+    return CalibrationReport(
+        n_events=250,
+        overall_accuracy=0.95,
+        per_class={
+            "no_deadline": ClassCounts(tp=100, fp=5, fn=3),
+            "explicit": ClassCounts(tp=80, fp=3, fn=2),
+            "inferred": ClassCounts(tp=60, fp=4, fn=3),
+        },
+        calibration_buckets=[],
+        due_at_agreement_rate=0.95,
+        divergence_recall=0.9,
+    )
+
+
+def _failing_calibration_report() -> CalibrationReport:
+    """A synthetic report with enough volume but below the recall floor for 'inferred'."""
+    return CalibrationReport(
+        n_events=250,
+        overall_accuracy=0.7,
+        per_class={
+            "no_deadline": ClassCounts(tp=100, fp=5, fn=3),
+            "explicit": ClassCounts(tp=80, fp=3, fn=2),
+            "inferred": ClassCounts(tp=20, fp=4, fn=40),  # recall well below the 0.70 floor
+        },
+        calibration_buckets=[],
+        due_at_agreement_rate=0.6,
+        divergence_recall=0.5,
+    )
+
+
+def test_deadline_gate_blocks_when_no_calibration_source_wired(store) -> None:
+    """Default posture: no data feed wired -> insufficient_data -> stays shadow, even in
+    live mode."""
+    gov = NudgeGovernor(store, mode="live")
+    decision = gov.deadline_go_no_go()
+    assert decision.verdict == "insufficient_data"
+
+    result = gov._emit(_deadline_candidate("blocked"), None, NOW)  # noqa: SLF001
+    assert result is not None  # still proposed (shadow)
+    assert result.nudge_id is None  # NOT persisted live
+    with store.session() as session:
+        assert session.query(Nudge).filter(Nudge.kind == _DEADLINE_REMINDER).count() == 0
+
+
+def test_deadline_gate_blocks_on_failing_calibration(store) -> None:
+    """A wired-but-failing calibration source also keeps deadline nudges shadow."""
+    gov = NudgeGovernor(
+        store, mode="live", deadline_calibration_source=_failing_calibration_report
+    )
+    assert gov.deadline_go_no_go().verdict == "no_go"
+
+    result = gov._emit(_deadline_candidate("no-go"), None, NOW)  # noqa: SLF001
+    assert result is not None
+    assert result.nudge_id is None
+    with store.session() as session:
+        assert session.query(Nudge).filter(Nudge.kind == _DEADLINE_REMINDER).count() == 0
+
+
+def test_deadline_gate_opens_on_passing_calibration(store) -> None:
+    """A synthetic calibration set clearing the floors opens the gate: deadline-derived
+    nudges are now persisted live."""
+    gov = NudgeGovernor(
+        store, mode="live", deadline_calibration_source=_passing_calibration_report
+    )
+    assert gov.deadline_go_no_go().verdict == "go"
+
+    result = gov._emit(_deadline_candidate("go"), None, NOW)  # noqa: SLF001
+    assert result is not None
+    assert result.nudge_id is not None
+    with store.session() as session:
+        row = session.query(Nudge).filter(Nudge.kind == _DEADLINE_REMINDER).one()
+        assert row.delivered_at is not None
+
+
+def test_deadline_gate_does_not_scope_misallocation_or_device_care(store) -> None:
+    """Critical honesty-scoping test: S0.2 measures only the deadline extractor, so this
+    gate must never promote OR block priority/misallocation or device-care nudges --
+    those stay governed by `mode` alone, in both gate directions."""
+    misalloc_candidate = _Candidate(
+        kind=_MISALLOCATION, confidence=0.95, priority=1,
+        message_summary="switch to the higher-priority item",
+        idempotency_basis=(_MISALLOCATION, "scoping-test"),
+    )
+    care_candidate = _Candidate(
+        kind="device.care", confidence=1.0, priority=1,
+        message_summary="battery low", idempotency_basis=("device.care", "scoping-test"),
+    )
+
+    # Gate wide open ("go") must not be REQUIRED for non-deadline kinds to deliver live --
+    # they already do under `mode="live"` alone, same as before this gate existed.
+    gov_open = NudgeGovernor(
+        store, mode="live", deadline_calibration_source=_passing_calibration_report
+    )
+    assert gov_open.deadline_go_no_go().verdict == "go"
+    fired_open = gov_open._emit(misalloc_candidate, None, NOW)  # noqa: SLF001
+    care_open = gov_open._emit(care_candidate, None, NOW)  # noqa: SLF001
+    assert fired_open is not None and fired_open.nudge_id is not None
+    assert care_open is not None and care_open.nudge_id is not None
+
+    # Gate closed (default: no source wired -> insufficient_data) must not BLOCK them
+    # either -- non-deadline kinds are simply outside this gate's authority either way.
+    misalloc_candidate_2 = _Candidate(
+        kind=_MISALLOCATION, confidence=0.95, priority=1,
+        message_summary="switch to the higher-priority item",
+        idempotency_basis=(_MISALLOCATION, "scoping-test-2"),
+    )
+    care_candidate_2 = _Candidate(
+        kind="device.care", confidence=1.0, priority=1,
+        message_summary="battery low", idempotency_basis=("device.care", "scoping-test-2"),
+    )
+    gov_closed = NudgeGovernor(store, mode="live")  # no deadline_calibration_source wired
+    assert gov_closed.deadline_go_no_go().verdict == "insufficient_data"
+    fired_closed = gov_closed._emit(misalloc_candidate_2, None, NOW)  # noqa: SLF001
+    care_closed = gov_closed._emit(care_candidate_2, None, NOW)  # noqa: SLF001
+    assert fired_closed is not None and fired_closed.nudge_id is not None
+    assert care_closed is not None and care_closed.nudge_id is not None
