@@ -24,12 +24,9 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Creating virtualenv with uv at $VENV_DIR"
-uv venv "$VENV_DIR"
-
-echo "==> Installing cadence (editable) into the venv"
-# Add the fcm extra if you use FCM push: install "$REPO_ROOT"[fcm]
-uv pip install --python "$VENV_DIR/bin/python" -e "$REPO_ROOT"
+echo "==> Building the service environment from the lockfile (uv sync) at $VENV_DIR"
+# Runtime deps only (--no-dev), pinned by uv.lock. Add FCM push with: --extra fcm
+( cd "$REPO_ROOT" && UV_PROJECT_ENVIRONMENT="$VENV_DIR" uv sync --locked --no-dev )
 
 echo "==> Creating data + config directories"
 mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$UNIT_DIR"

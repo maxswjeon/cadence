@@ -41,8 +41,7 @@ defeat the privacy model. The runtime is single-user too, so both belong in
 ## Manual setup (without the script)
 
 ```bash
-uv venv ~/.local/share/cadence/venv
-uv pip install --python ~/.local/share/cadence/venv/bin/python -e .
+UV_PROJECT_ENVIRONMENT=~/.local/share/cadence/venv uv sync --locked --no-dev
 mkdir -p ~/.config/cadence ~/.local/state/cadence ~/.config/systemd/user
 cp packaging/systemd/cadence.env.example ~/.config/cadence/cadence.env
 cp packaging/systemd/cadence-*.service    ~/.config/systemd/user/

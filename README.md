@@ -63,22 +63,21 @@ The architecture rationale and the system invariants are documented in `AGENTS.m
 
 ## Quickstart (the brain)
 
-Uses [`uv`](https://docs.astral.sh/uv/) for the environment:
+This is a [`uv`](https://docs.astral.sh/uv/)-native project (`uv.lock` committed):
 
 ```bash
-uv venv && source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv sync            # create .venv from the lockfile (dev tools included)
 
 # Test + lint
-pytest
-ruff check .
+uv run pytest
+uv run ruff check .
 
 # Run the full runtime — ingest API + engine + delivery (schema self-initializes).
 # Serves on 127.0.0.1:3245 by default (0x0CAD; override with CADENCE_HTTP_PORT).
-CADENCE_REQUIRE_MTLS=false cadence runtime
+CADENCE_REQUIRE_MTLS=false uv run cadence runtime
 
 # Feed it this machine's live signals (in another shell)
-CADENCE_INGEST_URL=http://127.0.0.1:3245/ingest/event cadence devbox --once
+CADENCE_INGEST_URL=http://127.0.0.1:3245/ingest/event uv run cadence devbox --once
 ```
 
 A single `cadence` command drives everything: `cadence runtime`, `cadence devbox`,
