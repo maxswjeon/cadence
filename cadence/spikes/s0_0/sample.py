@@ -144,8 +144,9 @@ def build_bootstrap_sample(nas: NASStore) -> tuple[SignalLog, LabelStore]:
         "msg-100",
         has_deadline=True,
         notes=(
-            "subject says 'by Friday' -- a real implied deadline, but the rule "
-            "extractor cannot parse a relative weekday; expected FALSE NEGATIVE"
+            "subject says 'by Friday' -- a real implied deadline; was an expected "
+            "FALSE NEGATIVE until the extractor's relative-weekday parser shipped, "
+            "now correctly predicted inferred"
         ),
     )
     _label("msg-101", has_deadline=False, notes="newsletter, no deadline phrase")
@@ -159,8 +160,9 @@ def build_bootstrap_sample(nas: NASStore) -> tuple[SignalLog, LabelStore]:
         "synthetic:fp-trap",
         has_deadline=False,
         notes=(
-            "contains the keyword 'due' near an unrelated date; expected FALSE "
-            "POSITIVE from the rule extractor (precision trap)"
+            "contains the keyword 'due' near an unrelated date, but not tied to it -- "
+            "was a FALSE POSITIVE (precision trap) until the extractor's "
+            "keyword-proximity fix; now correctly predicted no_deadline"
         ),
     )
     _label(

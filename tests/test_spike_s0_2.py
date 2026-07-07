@@ -38,8 +38,10 @@ def _event(event_id, summary=None, structured=None, occurred_at=None) -> Event:
 
 
 def test_evaluate_known_answer_confusion_matrix():
-    # 1 true positive (explicit), 1 false positive (keyword trap), 1 false negative
-    # (unparseable relative date), 1 true negative.
+    # 1 true positive (explicit), 1 true negative (keyword trap -- the extractor now
+    # correctly ties "due" to an adjacent date only, so this one no longer misfires),
+    # 1 false negative (a relative-date phrase the extractor still can't parse), 1
+    # true negative (plain chatter).
     tp_explicit = _event("tp", structured={"due_at": "2026-07-10T00:00:00+00:00"})
     fp_trap = _event("fp", summary="Shipped on 2026-01-01, nothing else is due right now")
     fn_missed = _event("fn", summary="wrap this up before next Friday")
@@ -59,30 +61,31 @@ def test_evaluate_known_answer_confusion_matrix():
     explicit = report.per_class["explicit"]
     inferred = report.per_class["inferred"]
 
-    # tn_chatter is the only correct no_deadline call. fp_trap is actually no_deadline
-    # but gets mis-predicted "inferred" (a false negative for no_deadline, a false
-    # positive for inferred). fn_missed is actually "inferred" but gets mis-predicted
+    # fp_trap and tn_chatter are both correct no_deadline calls -- the extractor's
+    # keyword-proximity fix means an unrelated date near "due" no longer fires.
+    # fn_missed is actually "inferred" ("before next Friday" isn't a gated keyword
+    # phrase, so the relative-weekday parser never sees it) but gets mis-predicted
     # "no_deadline" (a false positive for no_deadline, a false negative for inferred).
-    assert no_deadline.tp == 1  # tn_chatter
+    assert no_deadline.tp == 2  # fp_trap, tn_chatter
     assert no_deadline.fp == 1  # fn_missed wrongly predicted no_deadline
-    assert no_deadline.fn == 1  # fp_trap wrongly predicted inferred instead
+    assert no_deadline.fn == 0
 
     assert explicit.tp == 1  # tp_explicit
     assert explicit.fp == 0
     assert explicit.fn == 0
 
     assert inferred.tp == 0
-    assert inferred.fp == 1  # fp_trap wrongly predicted inferred
+    assert inferred.fp == 0
     assert inferred.fn == 1  # fn_missed actually inferred but predicted no_deadline
 
-    assert no_deadline.precision == 0.5
-    assert no_deadline.recall == 0.5
+    assert no_deadline.precision == 2 / 3
+    assert no_deadline.recall == 1.0
     assert explicit.precision == 1.0
     assert explicit.recall == 1.0
-    assert inferred.precision == 0.0
+    assert inferred.precision is None  # 0/0: no inferred predictions were made at all
     assert inferred.recall == 0.0
 
-    assert report.overall_accuracy == 0.5
+    assert report.overall_accuracy == 0.75
     assert report.priority_status == PRIORITY_NOT_EVALUATED
 
 
