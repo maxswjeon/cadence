@@ -8,7 +8,7 @@ namespace Cadence.WindowsAgent.Models;
 ///
 /// Reconciled against the real <c>contract/event-envelope.schema.json</c> (W1, landed after
 /// this file was first written) and the brain's <c>cadence.adapters.base.Event</c> (pydantic
-/// model, /home/swjeon/projects/cadence/cadence/adapters/base.py). The schema sets
+/// model, cadence/adapters/base.py). The schema sets
 /// <c>additionalProperties: false</c> (mirroring <c>Event.model_config["extra"] = "forbid"</c>),
 /// so an unrecognized property is a hard `422` envelope-shape rejection
 /// (<c>contract/protocol.md</c> §2) — every <c>[JsonPropertyName]</c> below is the exact,

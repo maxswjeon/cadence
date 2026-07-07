@@ -8,7 +8,7 @@ namespace Cadence.WindowsAgent.Models;
 /// closed — a 10th value is a `422` envelope-shape rejection under the schema's
 /// `additionalProperties: false`/closed-enum semantics) and the brain's
 /// <c>cadence.adapters.base.AcquisitionTier</c> (Python `StrEnum`,
-/// /home/swjeon/projects/cadence/cadence/adapters/base.py) field-for-field.
+/// cadence/adapters/base.py) field-for-field.
 ///
 /// <see cref="DeviceOsApi"/> ("device_os_api") started as this skeleton's speculative
 /// placeholder for a real taxonomy gap — none of the original 8 brain-side values cleanly
