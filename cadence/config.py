@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -124,6 +125,62 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- LLM inference (M4; OFF by default, shadow-gated until S0.2) --------
+    llm_provider: str = Field(
+        default="none",
+        description=(
+            "Which LLM transport to use: 'none' (default, no inference), 'openai_api' "
+            "(API key — the supported, pay-per-token default), or 'chatgpt_oauth' "
+            "(opt-in, gray-zone, may break, message-count limits). See cadence/llm/README.md."
+        ),
+    )
+    llm_model: str = Field(
+        default="gpt-5.5",
+        description="Model id sent in the Responses-API request body.",
+    )
+    llm_enabled: bool = Field(
+        default=False,
+        description=(
+            "Go-live opt-in for the inference hooks. False (default) keeps llm_hook / "
+            "receptiveness_hook inert (no LLM calls, no egress) even if a provider is "
+            "configured. Enabling still runs the governor in shadow mode until S0.2 passes."
+        ),
+    )
+    openai_api_base: str = Field(
+        default="https://api.openai.com/v1",
+        description="Base URL for the API-key Responses endpoint ('/responses' is appended).",
+    )
+
+    # --- ChatGPT-OAuth block (Codex defaults; all env-overridable) ----------
+    chatgpt_oauth_client_id: str = Field(
+        default="app_EMoamEEZ73f0CkXaXp7hrann",
+        description="Public Codex OAuth client_id presented to the ChatGPT backend.",
+    )
+    chatgpt_oauth_issuer: str = Field(
+        default="https://auth.openai.com",
+        description="OAuth issuer (authorize/token/revoke live under here).",
+    )
+    chatgpt_oauth_scopes: str = Field(
+        default="openid profile email offline_access api.connectors.read api.connectors.invoke",
+        description="Space-separated OAuth scopes requested during onboarding.",
+    )
+    chatgpt_oauth_originator: str = Field(
+        default="codex_cli_rs",
+        description="'originator' header/param identifying the client to the ChatGPT backend.",
+    )
+    chatgpt_base: str = Field(
+        default="https://chatgpt.com/backend-api/codex",
+        description="ChatGPT Codex backend base URL ('/responses' is appended for inference).",
+    )
+    chatgpt_oauth_redirect_port: int = Field(
+        default=1455,
+        description="Loopback redirect port for the onboarding PKCE flow (fallback 1457).",
+    )
+    chatgpt_oauth_redirect_port_fallback: int = Field(
+        default=1457,
+        description="Fallback loopback port tried when chatgpt_oauth_redirect_port is taken.",
+    )
+
     # --- Raw-boundary tuning -----------------------------------------------
     max_summary_len: int = Field(
         default=500,
@@ -162,6 +219,30 @@ class Settings(BaseSettings):
             candidates = (self.data_dir, self.nas_dir, self.r2_dir, self.d1_path.parent)
             common = os.path.commonpath([str(p.resolve()) for p in candidates])
             self.nas_root = Path(common)
+        return self
+
+    @model_validator(mode="after")
+    def _require_https_endpoints(self) -> Settings:
+        """Reject a plaintext ``http://`` OAuth/inference endpoint (env-overridable → hostile).
+
+        ``chatgpt_oauth_issuer``, ``chatgpt_base``, and ``openai_api_base`` carry the auth
+        code / refresh token / API key. If an attacker (or a typo) sets one to
+        ``http://…`` the secret would leave in cleartext, so we require ``https://`` —
+        exempting loopback (``localhost`` / ``127.0.0.1`` / ``::1``) so the fake-server
+        tests and local dev proxies still work.
+        """
+        for name in ("chatgpt_oauth_issuer", "chatgpt_base", "openai_api_base"):
+            url = getattr(self, name)
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme == "https":
+                continue
+            if parsed.scheme == "http" and host in ("localhost", "127.0.0.1", "::1"):
+                continue
+            raise ValueError(
+                f"{name} must use https:// (got {url!r}); only loopback hosts may use "
+                "http. A plaintext endpoint would exfiltrate the OAuth code / token."
+            )
         return self
 
 

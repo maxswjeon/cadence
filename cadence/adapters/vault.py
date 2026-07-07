@@ -30,6 +30,13 @@ from cadence.obs.alarms import get_alarm_sink
 # inside settings.nas_root rather than just blocklisting known cloud-tier substrings.
 _FORBIDDEN_CLOUD_MARKERS = ("r2_blobs", "d1.sqlite")
 
+#: Providers whose secrets are *real, minted* live credentials (OAuth tokens / API keys)
+#: rather than M1 placeholders. Persisting one of these under the publicly-known
+#: DEFAULT_VAULT_MASTER_KEY is refused in **every** env (not just prod): the stub cipher
+#: with a checked-in key offers no protection, so a real ChatGPT-OAuth / API-key login
+#: must set CADENCE_VAULT_MASTER_KEY first. (Placeholder providers stay allowed in dev.)
+_LIVE_CRED_PROVIDERS = frozenset({"chatgpt_oauth", "openai_api"})
+
 
 def _keystream(key: bytes, salt: bytes, n: int) -> bytes:
     """Deterministic SHA-256 keystream (STUB cipher, not for production)."""
@@ -125,15 +132,35 @@ class FileCredentialVault(CredentialVault):
     # -- atomic file I/O ------------------------------------------------------ #
 
     def _atomic_write(self, path: Path, data: bytes, *, mode: int = 0o600) -> None:
-        """Write via temp-file + ``os.replace`` so a crash mid-write can't corrupt ``path``."""
+        """Write via temp-file + ``os.replace`` so a crash mid-write can't corrupt ``path``.
+
+        The temp file is created with its restrictive ``mode`` already applied (via
+        ``os.open`` + ``O_CREAT|O_EXCL``) rather than written-then-chmod'd, so the secret
+        never briefly exists at the process umask. ``O_EXCL`` also prevents clobbering a
+        pre-existing temp file (the pid+tid suffix already makes collisions unlikely).
+        """
         tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
-        tmp.write_bytes(data)
-        os.chmod(tmp, mode)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+        except BaseException:
+            os.unlink(tmp)
+            raise
         os.replace(tmp, path)
 
     # -- CredentialVault contract ------------------------------------------ #
 
     def store(self, provider: str, account_ref: str, secret: dict[str, Any]) -> None:
+        if (
+            provider in _LIVE_CRED_PROVIDERS
+            and self._settings.vault_master_key == DEFAULT_VAULT_MASTER_KEY
+        ):
+            raise ValueError(
+                f"refusing to persist live '{provider}' credentials under the default "
+                "vault_master_key: the stub cipher's checked-in key protects nothing. "
+                "Set CADENCE_VAULT_MASTER_KEY to a real secret before authenticating."
+            )
         get_alarm_sink().fire(
             "credential_vault_access",
             {"op": "store", "provider": provider, "account_ref": account_ref},
