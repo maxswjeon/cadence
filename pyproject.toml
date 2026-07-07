@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Cadence — self-hosted personal-assistant brain (Milestone 1 foundation spine)"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Proprietary" }
+license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "Cadence" }]
 dependencies = [
     "fastapi>=0.110",

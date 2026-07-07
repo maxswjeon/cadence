@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Portable, crash-safe capture core for Cadence device agents (WAL, dedupe, backpressure, mTLS transport)."
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 publish = false
 
 # A `cdylib` is emitted so the Android (JNI) and Windows (P/Invoke) agents can bind

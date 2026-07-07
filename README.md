@@ -32,9 +32,7 @@ test`/`clippy`/`fmt` clean). CI runs all of it on every push — see below.
 | **M5** | **Runtime** | The pieces that make it *run*: a resilient tick scheduler, nudge delivery (console / FCM HTTP v1 / mock), the LLM factory that only activates when gated conditions are met, a feedback endpoint, and one service entrypoint that composes the whole brain. |
 | **M6** | **Devbox source** | A capture source for an always-on dev server (the machine that runs your coding jobs while you're mobile): git WIP / stale-branch signals, "your run finished/crashed while you were away", activity cadence, and host health — **content-free and own-user-only by construction** (see Privacy). |
 
-The full architecture rationale (Decisions A–I) lives in
-`.omc/plans/cadence-consensus-plan.md`; each milestone's exact scope and acceptance
-criteria are in `.omc/plans/cadence-milestone-*.md`.
+The architecture rationale and the system invariants are documented in `AGENTS.md`.
 
 ## Privacy & honesty posture (enforced in code, not just promised)
 
@@ -107,46 +105,26 @@ action pinned to a full commit SHA** for supply-chain safety:
 
 ## Architecture (the built spine)
 
+```mermaid
+flowchart TD
+    SRC[Source Adapters] -->|"Event · structured, never raw"| ING[Ingestion API]
+    ING --> FG[FactGraph]
+    ING --> PROJ[Projection]
+    ING --> DL[Deadline Extractor]
+    FG --> D1
+    PROJ --> D1
+    DL --> D1
+    D1[(D1 · local-canonical SQLite)]
+    D1 -->|"async · boundary re-checked"| REP[(Cloudflare D1 replica)]
+    D1 -->|"id / hash"| NAS[(NAS · raw evidence)]
+    NAS -->|"derived only"| R2[(R2 · derived blobs)]
+    D1 --> ENG[Engine loop] -->|"nudge"| DLV[Delivery]
+
+    classDef store fill:#e8ecff,stroke:#5566aa,color:#111a33;
+    class D1,REP,NAS,R2 store;
 ```
- ┌───────────────── Source Adapters (per-account / per-device) ─────┐
- │  Adapter ABC: fetch() → normalize() → emit()                     │
- │  GitHub · Google Calendar · Email · devbox (+ device agents)     │
- │  common Event schema (provenance-tagged) + AcquisitionTier       │
- │  CredentialVault (NAS-only, encrypted-at-rest, nas_root-checked) │
- └───────────────────────────┬───────────────────────────────────────┘
-                              │ Event (structured + NAS pointer, never raw)
- ┌────────────────────────────▼──────────────────────────────────────┐
- │ Ingestion (FastAPI POST /ingest/event, mTLS-checked, fail-closed)  │
- │   WALBuffer (backpressure) → dedupe_id → … (serialized per-event)  │
- └───────────┬───────────────────┬─────────────────────┬─────────────┘
-             │                   │                      │
-     ┌───────▼────────┐  ┌───────▼─────────┐  ┌──────────▼────────────┐
-     │  FactGraph      │  │  Projection      │  │ RuleDeadlineExtractor │
-     │  (assert_fact,  │  │  (typed rows:    │  │ (explicit + inferred, │
-     │   dedup+merge)  │  │  calendar_event, │  │  optional LLM hook)   │
-     │                 │  │  task)           │  │                       │
-     └───────┬─────────┘  └────────┬─────────┘  └───────────┬───────────┘
-             │ fact row            │ typed rows              │ deadline rows
-             ▼                     ▼                         ▼
- ┌──────────────────────── D1 (LOCAL-CANONICAL SQLite) ─────────────────────────────┐
- │ calendar_event · task · deadline · person · place · source_account ·             │
- │ fact · nudge · feedback · sync_session                                           │
- │ Every write passes SchemaBoundary (structural per-table column allowlist) +      │
- │ PayloadClassifier (heuristic backstop) — no verbatim content, ever.              │
- └───────────────────┬───────────────────────────────────────┬──────────────────────┘
-                     │ async enqueue (boundary re-checked)     │ raw_evidence_id/hash
-            ┌────────▼─────────────┐                 ┌─────────▼─────────┐
-            │ Cloudflare D1 replica│                 │      NAS          │
-            │ (off-site durable    │                 │ (raw evidence,    │
-            │  structured replica) │                 │  content-addressed│
-            └───────────────────────┘                │  local blob dir)  │
-                                                       └─────────┬─────────┘
-                     Engine loop (periodic tick):                │ derived blobs only
-   AttentionState → priority + misallocation →         ┌─────────▼─────────┐
-   Nudge Governor (shadow/live) → delivery             │        R2         │
-                                                        │ (derived blobs)   │
-                                                        └────────────────────┘
-```
+
+**Source Adapters** (GitHub · Google Calendar · Email · devbox · device agents) `fetch → normalize → emit` provenance-tagged Events — structured fields plus a NAS pointer, never raw. **Ingestion** (FastAPI, mTLS, fail-closed) WAL-buffers and dedupes, then fans out to the **FactGraph**, the typed-row **Projection** (`calendar_event`/`task`), and the **Deadline Extractor** (rule-based, optional LLM hook). All land in **D1**, the local-canonical SQLite store — every write passes the structural `SchemaBoundary` + `PayloadClassifier`, so no verbatim content is stored. D1 replicates structured rows off-site to **Cloudflare D1**; raw evidence lives only in **NAS** (content-addressed), and derived blobs go to **R2**. The **Engine loop** (AttentionState → priority + misallocation → Nudge Governor, shadow/live) drives **Delivery**.
 
 **Invariants** (full list in `AGENTS.md`): hot-path reads/writes hit local SQLite, never
 the cloud replica; D1/R2/replica hold structured/derived only — raw lives solely in NAS by
@@ -164,12 +142,12 @@ contract/       the device↔brain wire contract (event envelope schema + protoc
 alembic/        the frozen D1 schema migration
 tests/          the Python test suite (404 tests)
 .github/        CI (SHA-pinned)
-.omc/plans/     the consensus plan + per-milestone specs
+AGENTS.md       architecture rationale + the system invariants
 ```
 
 ## License
 
-Personal project, source-available. The Rust capture core (`agents/core`) is offered under
-`MIT OR Apache-2.0` (see its `Cargo.toml`); the Python brain is currently marked
-proprietary in `pyproject.toml`. There is no general grant beyond that — if you want to use
-a part of this, ask.
+Licensed under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later)
+— see [`LICENSE`](LICENSE). The AGPL's network-use clause matters for a self-hosted service
+like this: if you run a modified version and let others interact with it over a network,
+you must offer them the corresponding source.
