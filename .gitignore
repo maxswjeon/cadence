@@ -25,13 +25,9 @@ data/
 /r2_blobs/
 /vault/
 
-# OMC / OMX operational state (already ignored by convention)
-# Design record (.omc/plans, .omc/specs, .omc/research) IS committed intentionally.
-.omc/state/
-.omc/logs/
-.omc/artifacts/
-.omc/sessions/
-.omc/handoffs/
+# OMC / OMX operational state and internal design record — kept local, out of
+# the public tree (planning/research is private deliberation, not shipped).
+.omc/
 .omx/
 .remember/
 
@@ -44,14 +40,5 @@ data/
 agents/core/target/
 target/
 
-# Nested OMC runtime state (created by workers running in subdirs)
-**/.omc/state/
-**/.omc/sessions/
-**/.omc/artifacts/
-**/.omc/logs/
-**/.omc/handoffs/
-
-# OMC project memory (runtime)
-.omc/project-memory.json
-.omc/notepad.md
-.omc/project-memory.json
+# Nested OMC state (created by workers running in subdirs)
+**/.omc/
