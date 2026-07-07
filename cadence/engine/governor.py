@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -122,6 +123,12 @@ class NudgeGovernor:
         #: Documented seam: refine a candidate's confidence from receptiveness / a future
         #: LLM signal. ``None`` (default) leaves the rule confidence untouched.
         self.receptiveness_hook = receptiveness_hook
+        # Serializes the in-memory threshold read-modify-write (and the feedback
+        # idempotency check) so the scheduler thread (which reads thresholds inside
+        # `_emit`) and the FastAPI feedback handler (a *different* threadpool thread that
+        # writes them via `record_feedback`) can't lose an update. Re-entrant because
+        # `record_feedback` calls `_adjust` while already holding it.
+        self._lock = threading.RLock()
         self.thresholds: dict[str, float] = {}
         #: Proposed nudges (populated in shadow mode; also mirrors live emissions).
         self.proposals: list[ProposedNudge] = []
@@ -137,14 +144,18 @@ class NudgeGovernor:
     # -- thresholds --------------------------------------------------------- #
 
     def _threshold(self, kind: str) -> float:
-        raw = self.thresholds.get(kind, self.config.base_threshold)
+        with self._lock:
+            raw = self.thresholds.get(kind, self.config.base_threshold)
         return max(self.config.min_threshold, min(self.config.recall_ceiling, raw))
 
     def _adjust(self, kind: str, delta: float) -> None:
-        current = self.thresholds.get(kind, self.config.base_threshold)
-        self.thresholds[kind] = max(
-            self.config.min_threshold, min(self.config.recall_ceiling, current + delta)
-        )
+        # Atomic read-modify-write under the lock — a concurrent feedback call can't
+        # read a stale value and clobber another thread's update.
+        with self._lock:
+            current = self.thresholds.get(kind, self.config.base_threshold)
+            self.thresholds[kind] = max(
+                self.config.min_threshold, min(self.config.recall_ceiling, current + delta)
+            )
 
     # -- inference path: misallocation ------------------------------------- #
 
@@ -334,21 +345,44 @@ class NudgeGovernor:
     def record_feedback(
         self, nudge_id: str, kind: str, note: str | None = None
     ) -> Feedback:
-        """Record Thanks/Dismiss on a nudge and adjust its category threshold."""
+        """Record Thanks/Dismiss on a nudge and adjust its category threshold.
+
+        Every call persists a :class:`Feedback` row (the full audit survives), but the
+        threshold delta is applied **once per (nudge_id, kind)**: a double-tap or a replayed
+        callback of the *same* signal records the extra feedback yet cannot walk the category
+        threshold to its clamp (which would mute — or force — a whole category). A genuine
+        change of mind (dismiss, then later thanks) is a *different* kind, so it still
+        applies. The existence check and the adjust are done under :attr:`_lock` so two
+        concurrent taps of the same kind can't both apply.
+        """
         if kind not in ("thanks", "dismiss"):
             raise ValueError(f"feedback kind must be 'thanks' or 'dismiss', got {kind!r}")
-        with self.d1.session() as session:
-            nudge = session.get(Nudge, nudge_id)
-            if nudge is None:
-                # Never blindly adjust a category for an unknown nudge — that would move the
-                # wrong threshold on a bogus/foreign id.
-                raise ValueError(f"unknown nudge_id {nudge_id!r}")
-            category = nudge.kind
-        weight = 1.0 if kind == "thanks" else -1.0
-        fb = Feedback(nudge_id=nudge_id, signal=kind, weight=weight, note_summary=note)
-        self.d1.write(fb)
-        delta = self.config.thanks_delta if kind == "thanks" else self.config.dismiss_delta
-        self._adjust(category, delta)
+        with self._lock:
+            with self.d1.session() as session:
+                nudge = session.get(Nudge, nudge_id)
+                if nudge is None:
+                    # Never blindly adjust a category for an unknown nudge — that would move
+                    # the wrong threshold on a bogus/foreign id.
+                    raise ValueError(f"unknown nudge_id {nudge_id!r}")
+                category = nudge.kind
+                # Prior feedback of this same signal on this nudge means its delta was
+                # already applied — a replay of the same tap must not move the bar again.
+                already_adjusted = (
+                    session.execute(
+                        select(Feedback.id)
+                        .where(Feedback.nudge_id == nudge_id)
+                        .where(Feedback.signal == kind)
+                    ).first()
+                    is not None
+                )
+            weight = 1.0 if kind == "thanks" else -1.0
+            fb = Feedback(nudge_id=nudge_id, signal=kind, weight=weight, note_summary=note)
+            self.d1.write(fb)
+            if not already_adjusted:
+                delta = (
+                    self.config.thanks_delta if kind == "thanks" else self.config.dismiss_delta
+                )
+                self._adjust(category, delta)
         return fb
 
     def thanks_rate(self) -> float | None:

@@ -166,3 +166,69 @@ def test_nudge_carries_provenance_and_no_raw_violation(store) -> None:
         fact = session.get(Fact, row.fact_id)
         assert set(fact.source_event_ids) >= {"gh-refactor", "gh-report"}
     assert get_alarm_sink().count("raw_to_cloud_violation") == 0
+
+
+# --- feedback idempotency + threshold-update concurrency (M5 hardening) --------- #
+
+
+def test_feedback_adjusts_threshold_once_per_nudge(store) -> None:
+    """A double-tap / replayed callback records both rows but moves the bar only once."""
+    gov = NudgeGovernor(store, mode="live")
+    snap, finding = _canonical_finding(store)
+    nudge = gov.consider_misallocation(finding, snap, NOW)
+    assert nudge is not None and nudge.nudge_id is not None
+    category = nudge.kind
+
+    before = gov._threshold(category)  # noqa: SLF001
+    gov.record_feedback(nudge.nudge_id, "dismiss")
+    after_one = gov._threshold(category)  # noqa: SLF001
+    assert after_one > before  # a dismiss raises the bar
+
+    gov.record_feedback(nudge.nudge_id, "dismiss")  # replay / double-tap
+    after_two = gov._threshold(category)  # noqa: SLF001
+    assert after_two == after_one  # applied once only — no threshold poisoning
+
+    # Both feedback rows are still persisted for the audit trail.
+    with store.session() as session:
+        assert (
+            session.query(Feedback).filter(Feedback.nudge_id == nudge.nudge_id).count() == 2
+        )
+
+
+def test_threshold_update_is_atomic_under_concurrency(store) -> None:
+    """Concurrent `_adjust` calls (scheduler read vs feedback-thread write) lose no update.
+
+    A tiny GIL switch interval forces frequent thread switches mid critical-section, so an
+    *unlocked* read-modify-write would demonstrably lose updates (verified: ~3.7k/16k); the
+    lock makes the accumulation exact. This is a real regression guard, not a timing fluke.
+    """
+    import sys
+    import threading
+
+    from cadence.engine.governor import GovernorConfig
+
+    # Wide clamps so the accumulation is exact — this isolates the read-modify-write
+    # atomicity from the [min, ceiling] clamping.
+    gov = NudgeGovernor(
+        store,
+        mode="live",
+        config=GovernorConfig(base_threshold=0.0, min_threshold=-1e9, recall_ceiling=1e9),
+    )
+    n_threads, per_thread = 8, 2000
+
+    def worker() -> None:
+        for _ in range(per_thread):
+            gov._adjust("k", 1.0)  # noqa: SLF001
+
+    prev_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(prev_interval)
+
+    assert gov.thresholds["k"] == float(n_threads * per_thread)
