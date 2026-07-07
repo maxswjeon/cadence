@@ -8,16 +8,21 @@ Endpoints:
 * ``GET  /healthz``      — liveness.
 * ``GET  /metrics``      — Prometheus-format counters (alarms, egress, replication depth).
 
-mTLS is modeled by the :func:`require_mtls` dependency built per-app in
-:func:`create_app`. It **fails closed** by default (``settings.require_mtls``): a
-request without the ``X-Client-Cert`` header a TLS-terminating proxy would set is
-rejected. It is still a stub — only header *presence* is checked, not a real
-certificate — but an accidental prod deploy cannot silently accept unauthenticated
-callers; set ``require_mtls=False`` (dev/tests only) to open the stub back up.
+mTLS is modeled by the shared :func:`enforce_mtls` choke point, wrapped by a per-app
+``require_mtls`` dependency in :func:`create_app` (and reused by the feedback route in
+:mod:`cadence.runtime.service`). It **fails closed** by default
+(``settings.require_mtls``): a request without the ``X-Client-Cert`` header a
+TLS-terminating proxy would set is rejected — *unless* it comes from a loopback peer and
+``settings.trust_loopback_ingest`` is on, which lets a same-host poller ingest without a
+cert (the proxy still forwards the header for remote devices). It is still a stub — only
+header *presence* is checked, not a real certificate — but an accidental prod deploy
+cannot silently accept unauthenticated off-host callers; set ``require_mtls=False``
+(dev/tests only) to open the stub back up.
 """
 
 from __future__ import annotations
 
+import ipaddress
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -35,6 +40,46 @@ from cadence.stores.raw_boundary import RawBoundaryViolation
 _log = get_logger("brain.app")
 
 
+def _client_is_loopback(request: Request) -> bool:
+    """True only if the request's TCP peer is a loopback address (127.0.0.0/8, ::1).
+
+    Uses the connection's real peer (``request.client.host``), which is set by the ASGI
+    server from the socket and is **not** attacker-controllable via a header — a remote
+    caller cannot forge it. A missing/unparseable peer fails closed (not loopback).
+    """
+    client = request.client
+    if client is None:
+        return False
+    try:
+        return ipaddress.ip_address(client.host).is_loopback
+    except ValueError:
+        return False
+
+
+def enforce_mtls(request: Request, settings: Settings) -> None:
+    """Shared mTLS choke point — STUB, fails closed unless ``settings.require_mtls=False``.
+
+    Decision order (the ingest and feedback routes both route through here):
+
+    * ``require_mtls`` off → allow (dev/tests where mTLS is not terminated).
+    * ``X-Client-Cert`` header present → allow — proxied device traffic on the existing
+      cert path (when real mTLS is wired this verifies the client certificate; today it
+      only checks header presence).
+    * no header, but ``trust_loopback_ingest`` is set and the peer is loopback → allow —
+      a same-host poller (see :mod:`cadence.runtime.poller`) that does not proxy through
+      the TLS terminator. The peer address is the real socket peer, not a spoofable
+      header, so this never opens the gate to off-host callers.
+    * otherwise → 401.
+    """
+    if not settings.require_mtls:
+        return None
+    if request.headers.get("x-client-cert"):
+        return None
+    if settings.trust_loopback_ingest and _client_is_loopback(request):
+        return None
+    raise HTTPException(status_code=401, detail="mTLS client certificate required")
+
+
 def create_app(
     *,
     pipeline: IngestPipeline | None = None,
@@ -44,16 +89,8 @@ def create_app(
     settings = settings or get_settings()
 
     def require_mtls(request: Request) -> None:
-        """mTLS choke point — STUB, fails closed unless ``settings.require_mtls=False``.
-
-        When mutual TLS is wired, this verifies the client certificate; today it only
-        checks for the ``X-Client-Cert`` header a TLS-terminating proxy would set.
-        """
-        if not settings.require_mtls:
-            return None
-        if not request.headers.get("x-client-cert"):
-            raise HTTPException(status_code=401, detail="mTLS client certificate required")
-        return None
+        """Per-app dependency wrapping the shared :func:`enforce_mtls` choke point."""
+        enforce_mtls(request, settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -116,4 +153,4 @@ def create_app(
     return app
 
 
-__all__ = ["create_app"]
+__all__ = ["create_app", "enforce_mtls"]

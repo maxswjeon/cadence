@@ -485,6 +485,11 @@ class DevboxCollectorConfig:
     state_dir: Path = field(default_factory=_default_state_dir)
     poll_interval_seconds: float = 300.0
     ingest_url: str | None = None
+    #: Optional X-Client-Cert to send. Left None by default: the devbox poller runs on the
+    #: same host as the brain and POSTs to a loopback ingest URL, so it relies on the
+    #: loopback exemption in cadence.brain.app.enforce_mtls (settings.trust_loopback_ingest)
+    #: rather than forging a cert header. Set CADENCE_CLIENT_CERT only for a proxied/remote
+    #: deployment where a real mTLS terminator expects the header forwarded.
     client_cert_header: str | None = None
 
     # Per-collector enable

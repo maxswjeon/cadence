@@ -124,6 +124,17 @@ class Settings(BaseSettings):
             "set False only for local dev/tests where mTLS is not terminated."
         ),
     )
+    trust_loopback_ingest: bool = Field(
+        default=True,
+        description=(
+            "Same-host pollers are trusted: when require_mtls is on and a request "
+            "carries no X-Client-Cert header, it is allowed only if it originates "
+            "from loopback (127.0.0.1 / ::1). A properly-configured mTLS proxy still "
+            "forwards the client-cert header for remote devices, so remote callers "
+            "keep going through the cert path and never benefit from this exemption. "
+            "Set False to require the cert header even for same-host callers."
+        ),
+    )
 
     # --- LLM inference (M4; OFF by default, shadow-gated until S0.2) --------
     llm_provider: str = Field(

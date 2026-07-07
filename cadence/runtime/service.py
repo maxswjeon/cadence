@@ -27,15 +27,16 @@ is ``None`` unless the operator explicitly onboarded and enabled a provider.
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from cadence.adapters.base import Event  # noqa: F401 - re-exported context for callers
-from cadence.brain.app import create_app
+from cadence.brain.app import create_app, enforce_mtls
 from cadence.brain.deadlines import DeadlineCandidate, RuleDeadlineExtractor
 from cadence.config import Settings, get_settings
 from cadence.engine.engine import AttentionEngine
@@ -45,6 +46,12 @@ from cadence.obs.logging import get_logger
 from cadence.runtime.delivery import NudgeDelivery
 from cadence.runtime.delivery.console import ConsoleDelivery
 from cadence.runtime.delivery.mock import MockDelivery
+from cadence.runtime.poller import (
+    CursorStore,
+    PollerRuntimeConfig,
+    SourcePoller,
+    build_source_pollers,
+)
 from cadence.runtime.scheduler import TickScheduler
 from cadence.spikes.s0_2.calibration import CalibrationReport
 from cadence.stores.d1 import D1Store
@@ -77,6 +84,13 @@ class RuntimeConfig:
     #: HTTP listen port. Default 3245 (0x0CAD — "Cadence"); a distinctive, uncommon port
     #: that avoids the common 8000/8080 collisions and sits below the ephemeral range.
     http_port: int = 3245
+    #: Live-poll accounts. Empty by default → no pollers start (honest OFF posture).
+    poller: PollerRuntimeConfig = field(default_factory=PollerRuntimeConfig)
+
+    @property
+    def ingest_url(self) -> str:
+        """The loopback ingest URL a same-host poller POSTs to (see the loopback exemption)."""
+        return f"http://{self.http_host}:{self.http_port}/ingest/event"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -96,6 +110,7 @@ class RuntimeConfig:
             fcm_device_tokens=tuple(t.strip() for t in tokens.split(",") if t.strip()),
             http_host=env.get("CADENCE_HTTP_HOST", "127.0.0.1"),
             http_port=_parse_port(env.get("CADENCE_HTTP_PORT", "3245")),
+            poller=PollerRuntimeConfig.from_env(dict(env)),
         )
 
 
@@ -217,6 +232,7 @@ class CadenceRuntime:
         deadline_llm_hook: DeadlineLLMHook | None = None,
         receptiveness_hook: ReceptivenessHook | None = None,
         deadline_calibration_source: DeadlineCalibrationSource | None = None,
+        pollers: Sequence[SourcePoller] | None = None,
     ) -> None:
         self.config = config or RuntimeConfig()
         self.settings = settings or get_settings()
@@ -246,18 +262,29 @@ class CadenceRuntime:
         )
         self.app = self._build_app()
 
+        # Live-polling sources: injected in tests, else built from config. Empty by
+        # default — no configured accounts (or no vault creds) means no pollers start.
+        if pollers is not None:
+            self.pollers: list[SourcePoller] = list(pollers)
+        else:
+            cursor_store = CursorStore(self.settings.data_dir / "poller_cursors.json")
+            self.pollers = build_source_pollers(
+                self.config.poller,
+                ingest_url=self.config.ingest_url,
+                cursor_store=cursor_store,
+                settings=self.settings,
+            )
+        self._poller_threads: list[threading.Thread] = []
+
     def _build_app(self) -> FastAPI:
         app = create_app(pipeline=self.pipeline, settings=self.settings)
         governor = self.governor
         settings = self.settings
 
         def require_mtls(request: Request) -> None:
-            # Same fail-closed choke point as the ingest route (see brain.app.create_app).
-            if not settings.require_mtls:
-                return None
-            if not request.headers.get("x-client-cert"):
-                raise HTTPException(status_code=401, detail="mTLS client certificate required")
-            return None
+            # Same fail-closed choke point as the ingest route, including the loopback
+            # exemption for same-host pollers (see cadence.brain.app.enforce_mtls).
+            enforce_mtls(request, settings)
 
         @app.post("/nudge/{nudge_id}/feedback")
         def nudge_feedback(
@@ -277,10 +304,25 @@ class CadenceRuntime:
     # -- lifecycle ---------------------------------------------------------- #
 
     def start(self) -> None:
-        """Start the background tick scheduler (the HTTP app is served separately)."""
+        """Start the tick scheduler and one background thread per live poller.
+
+        The HTTP app is served separately. Pollers are OFF unless accounts were
+        configured (and their credentials exist), so this spawns nothing by default.
+        """
         self.scheduler.start()
+        self._poller_threads = []
+        for poller in self.pollers:
+            thread = threading.Thread(
+                target=poller.run,
+                name=f"cadence-poller-{poller.source.provider}",
+                daemon=True,
+            )
+            thread.start()
+            self._poller_threads.append(thread)
 
     def stop(self) -> None:
+        for poller in self.pollers:
+            poller.stop()
         self.scheduler.stop()
 
 

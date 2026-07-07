@@ -100,6 +100,48 @@ def test_mtls_disabled_accepts_request_without_cert_header(client) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Loopback exemption (same-host pollers ingest without a client cert)
+# --------------------------------------------------------------------------- #
+
+
+def _ingest_client(store, settings, *, client_addr, **overrides):
+    """A TestClient whose ASGI peer is ``client_addr`` (drives the loopback check)."""
+    settings = settings.model_copy(update={"require_mtls": True, **overrides})
+    pipeline = IngestPipeline(store)
+    app = create_app(pipeline=pipeline, settings=settings)
+    return TestClient(app, client=client_addr)
+
+
+def test_loopback_no_cert_header_is_allowed(store, settings) -> None:
+    with _ingest_client(store, settings, client_addr=("127.0.0.1", 40000)) as c:
+        r = c.post("/ingest/event", json=_event_body())
+        assert r.status_code == 202
+
+
+def test_non_loopback_no_cert_header_is_rejected(store, settings) -> None:
+    with _ingest_client(store, settings, client_addr=("203.0.113.7", 40000)) as c:
+        r = c.post("/ingest/event", json=_event_body())
+        assert r.status_code == 401
+
+
+def test_remote_with_cert_header_uses_existing_path(store, settings) -> None:
+    # A proxied remote device still forwards X-Client-Cert -> the cert path, not loopback.
+    with _ingest_client(store, settings, client_addr=("203.0.113.7", 40000)) as c:
+        r = c.post(
+            "/ingest/event", json=_event_body(), headers={"X-Client-Cert": "dev-fixture-cert"}
+        )
+        assert r.status_code == 202
+
+
+def test_loopback_exemption_off_rejects_loopback_no_cert(store, settings) -> None:
+    with _ingest_client(
+        store, settings, client_addr=("127.0.0.1", 40000), trust_loopback_ingest=False
+    ) as c:
+        r = c.post("/ingest/event", json=_event_body())
+        assert r.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
 # Raw-boundary violation -> 422 (not an opaque 500)
 # --------------------------------------------------------------------------- #
 

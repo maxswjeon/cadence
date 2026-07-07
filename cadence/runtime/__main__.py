@@ -56,6 +56,7 @@ def main() -> None:
         llm_enabled=deadline_hook is not None or receptiveness_hook is not None,
         http_host=config.http_host,
         http_port=config.http_port,
+        poller_count=len(runtime.pollers),
     )
     runtime.start()
     try:

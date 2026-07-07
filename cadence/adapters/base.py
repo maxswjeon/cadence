@@ -153,13 +153,21 @@ class Adapter(ABC):
     def normalize(self, raw: RawRecord) -> Event:
         """Convert one raw record into a provenance-tagged :class:`Event`."""
 
+    def finalize(self, event: Event) -> Event:
+        """Tag the acquisition tier (if unset) and fill the dedupe id.
+
+        Both :meth:`emit` (fixtures/records path) and the live-poll path
+        (:mod:`cadence.adapters.live`) route each normalized Event through here so the
+        two paths produce identically-tagged, dedupe-keyed Events.
+        """
+        if event.acquisition_tier is AcquisitionTier.UNKNOWN:
+            event.acquisition_tier = self.acquisition_tier
+        return event.with_dedupe_id()
+
     def emit(self) -> Iterator[Event]:
         """Default orchestration: fetch → normalize → tag dedupe id → yield."""
         for raw in self.fetch():
-            event = self.normalize(raw)
-            if event.acquisition_tier is AcquisitionTier.UNKNOWN:
-                event.acquisition_tier = self.acquisition_tier
-            yield event.with_dedupe_id()
+            yield self.finalize(self.normalize(raw))
 
 
 class AdapterRegistry:

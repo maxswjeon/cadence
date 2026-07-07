@@ -117,6 +117,53 @@ def test_feedback_rejects_bad_kind(store, settings) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Loopback exemption on the feedback route (same choke point as ingest)
+# --------------------------------------------------------------------------- #
+#
+# A request that PASSES the mTLS gate reaches record_feedback and 404s on the unknown
+# nudge id; a request BLOCKED by the gate 401s before ever getting there. That 404-vs-401
+# split is exactly what distinguishes "allowed" from "rejected" here.
+
+
+def _feedback_client(store, settings, *, client_addr, **overrides):
+    settings = settings.model_copy(update={"require_mtls": True, **overrides})
+    runtime = CadenceRuntime(
+        config=RuntimeConfig(governor_mode="live"), settings=settings, store=store
+    )
+    return TestClient(runtime.app, client=client_addr)
+
+
+def test_feedback_loopback_no_cert_header_is_allowed(store, settings) -> None:
+    c = _feedback_client(store, settings, client_addr=("127.0.0.1", 40000))
+    resp = c.post("/nudge/does-not-exist/feedback", json={"kind": "thanks"})
+    assert resp.status_code == 404  # passed the gate, unknown nudge
+
+
+def test_feedback_non_loopback_no_cert_header_is_rejected(store, settings) -> None:
+    c = _feedback_client(store, settings, client_addr=("203.0.113.7", 40000))
+    resp = c.post("/nudge/does-not-exist/feedback", json={"kind": "thanks"})
+    assert resp.status_code == 401
+
+
+def test_feedback_remote_with_cert_header_uses_existing_path(store, settings) -> None:
+    c = _feedback_client(store, settings, client_addr=("203.0.113.7", 40000))
+    resp = c.post(
+        "/nudge/does-not-exist/feedback",
+        json={"kind": "thanks"},
+        headers={"X-Client-Cert": "dev-fixture-cert"},
+    )
+    assert resp.status_code == 404  # cert path passed the gate, unknown nudge
+
+
+def test_feedback_loopback_exemption_off_rejects_loopback_no_cert(store, settings) -> None:
+    c = _feedback_client(
+        store, settings, client_addr=("127.0.0.1", 40000), trust_loopback_ingest=False
+    )
+    resp = c.post("/nudge/does-not-exist/feedback", json={"kind": "thanks"})
+    assert resp.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
 # Shadow: proposed, never delivered
 # --------------------------------------------------------------------------- #
 
