@@ -60,6 +60,27 @@ object CoreBridge {
     }
 
     /**
+     * Like [init], but the client private key never crosses the boundary: it stays in the
+     * Android StrongBox / TEE secure element and the mTLS client-auth signature is produced
+     * by [signer] (a [ClientAuthSigner], typically [StrongBoxSigner]). Used after the device
+     * has been accepted (B2) and its issued client cert delivered out-of-band.
+     *
+     * [configJson] is the delegated-signer config shape (see
+     * `agents/core/src/ffi.rs::SignerCoreConfig`): the same fields as [init]'s config **minus**
+     * `client_identity_pem` and **plus** `cert_chain_pem` (the issued client certificate chain,
+     * leaf first). The matching private key stays behind [signer].
+     *
+     * @throws CoreException if the core could not be initialized (see [nativeLastError]).
+     */
+    fun initWithSigner(configJson: String, signer: ClientAuthSigner) {
+        val h = nativeInitWithSigner(configJson, signer)
+        if (h == 0L) {
+            throw CoreException(nativeLastError() ?: "cadence_core_init_with_signer failed")
+        }
+        handle = h
+    }
+
+    /**
      * Durably appends one JSON-encoded [com.cadence.agent.envelope.EventEnvelope] to the
      * core's WAL, returning the envelope's `dedupe_id`.
      *
@@ -99,6 +120,7 @@ object CoreBridge {
     //     agents/core/src/jni.rs) --------------------------------------------------------- //
 
     private external fun nativeInit(configJson: String): Long
+    private external fun nativeInitWithSigner(configJson: String, signer: ClientAuthSigner): Long
     private external fun nativeCapture(handle: Long, envelopeJson: String): String
     private external fun nativePendingLen(handle: Long): Long
     private external fun nativeIsFull(handle: Long): Boolean
