@@ -55,6 +55,62 @@ internal static partial class CoreInterop
     internal static partial nint CadenceCoreInit(string configJson);
 
     /// <summary>
+    /// Managed shape of the C ABI's
+    /// <c>int32_t (*CadenceSignCallback)(void *ctx, const uint8_t *msg, size_t msg_len,
+    /// uint8_t *out_sig, size_t out_sig_cap, size_t *out_sig_len)</c> (see
+    /// <c>agents/core/include/cadence_agent_core.h</c>). Invoked on an internal transport thread
+    /// during the mTLS handshake so the client key can stay inside a secure element: the platform
+    /// SHA-256s the <paramref name="msgLen"/> bytes at <paramref name="msg"/>, signs with its P-256
+    /// key, writes the ASN.1-DER ECDSA-P256 signature into <paramref name="outSig"/> (capacity
+    /// <paramref name="outSigCap"/>, always &gt;= 72), sets <paramref name="outSigLen"/>, and
+    /// returns 0 on success or any non-zero value to fail the handshake closed.
+    /// <para>
+    /// Marshalled with <see cref="UnmanagedFunctionPointerAttribute"/>/<see
+    /// cref="CallingConvention.Cdecl"/> to match the crate's <c>extern "C"</c> ABI. Pointers cross
+    /// as <see cref="nint"/> and sizes as <see cref="nuint"/> (the <c>size_t</c> width).
+    /// <b>Lifetime:</b> the delegate instance handed to <see cref="CadenceCoreInitWithSigner"/> MUST
+    /// be kept rooted (a live managed reference) for the whole life of the returned handle — the
+    /// Rust core stores the raw function pointer and will call back into it; if the GC collects or
+    /// relocates the delegate the next handshake dereferences a dangling pointer. See
+    /// <c>Security/TpmCoreLauncher.cs</c>, which owns that root.
+    /// </para>
+    /// </summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int CadenceSignCallback(
+        nint ctx,
+        nint msg,
+        nuint msgLen,
+        nint outSig,
+        nuint outSigCap,
+        out nuint outSigLen);
+
+    /// <summary>
+    /// <c>CadenceCore* cadence_core_init_with_signer(const char* config_json,
+    /// CadenceSignCallback sign_callback, void* sign_ctx)</c> — like <see cref="CadenceCoreInit"/>,
+    /// but the client private key is held behind a hardware keystore and the client-auth signature
+    /// is produced by <paramref name="signCallback"/> (given <paramref name="signCtx"/>) instead of
+    /// an exportable PEM key. The config JSON is the same shape as <see cref="CadenceCoreInit"/>'s
+    /// MINUS <c>client_identity_pem</c> and PLUS <c>cert_chain_pem</c> (the client certificate chain
+    /// PEM, leaf first, no private key). Returns a non-zero opaque handle on success, or 0 on
+    /// failure (see <see cref="CadenceCoreLastError"/>). Handles built this way are
+    /// captured/drained/freed exactly like <see cref="CadenceCoreInit"/> handles.
+    /// <para>
+    /// Kept on classic <see cref="DllImportAttribute"/> rather than <see cref="LibraryImportAttribute"/>
+    /// for the same reason <c>NativeMethods.SetWinEventHook</c> is: the .NET 7+ source generator
+    /// does not marshal a managed delegate parameter (confirmed against the LibraryImportGenerator
+    /// compatibility matrix), so a P/Invoke that passes a <see cref="CadenceSignCallback"/> must use
+    /// <see cref="DllImportAttribute"/>. <see cref="UnmanagedType.LPUTF8Str"/> reproduces the
+    /// <c>StringMarshalling.Utf8</c> used by the source-generated imports above.
+    /// </para>
+    /// </summary>
+    [DllImport(CoreLibrary, EntryPoint = "cadence_core_init_with_signer",
+        ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint CadenceCoreInitWithSigner(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string configJson,
+        CadenceSignCallback signCallback,
+        nint signCtx);
+
+    /// <summary>
     /// <c>void cadence_core_shutdown(CadenceCore* handle)</c> — compacts the WAL, then frees the
     /// handle. NULL-safe. This is the only call that frees a handle; do not use it afterward.
     /// </summary>
