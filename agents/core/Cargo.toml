@@ -16,7 +16,10 @@ crate-type = ["rlib", "cdylib"]
 default = ["https"]
 # The reqwest/rustls mTLS transport. Tests do not need it (they use MockTransport),
 # but it is on by default so `cargo build/clippy/test` all lint the real transport.
-https = ["dep:reqwest"]
+# Pulls `rustls`/`ring` directly (not just transitively via reqwest) because the
+# delegated-signer client-auth path builds a rustls `ClientConfig` by hand and the
+# `SoftwareSigner` fallback signs with `ring`.
+https = ["dep:reqwest", "dep:rustls", "dep:ring"]
 # The JNI export layer (`src/jni.rs`) for the Android agent. Off by default so the
 # default `cargo build` (Windows P/Invoke path) does not pull the `jni` crate.
 jni = ["dep:jni"]
@@ -29,18 +32,21 @@ crc32fast = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 jni = { version = "0.21", optional = true }
+# The delegated-signer client-auth path builds a rustls `ClientConfig` directly (a
+# custom `ResolvesClientCert` -> `SigningKey` -> `Signer` that forwards to a
+# `ClientAuthSigner`) and hands it to reqwest via `use_preconfigured_tls`. Pinned to
+# the SAME rustls 0.23 reqwest already pulls (Cargo.lock: rustls 0.23.41) with the
+# `ring` provider — NOT aws-lc-rs — so `use_preconfigured_tls` accepts the config
+# (exact-version downcast) and no heavy C toolchain is dragged in. Both are gated by
+# the `https` feature, so `--no-default-features` builds neither.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+# `ring` performs the P-256 signature inside `SoftwareSigner` (the in-memory fallback
+# for devbox/CI/testing and the documented software `ClientAuthSigner` impl).
+ring = { version = "0.17", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-# --- M8 feasibility spike (delegated-signer mTLS) dev-deps -------------------
-# Named directly so the spike test can build a rustls ClientConfig/ServerConfig
-# and a custom SigningKey/Signer. Pinned to the SAME rustls 0.23 reqwest already
-# pulls (Cargo.lock: rustls 0.23.41) with the `ring` provider — NOT aws-lc-rs —
-# so `use_preconfigured_tls` accepts the config (exact-version downcast) and no
-# heavy C toolchain is dragged in. rcgen mints an in-memory test CA + certs;
-# `ring` performs the actual P-256 signature inside the "hardware" closure.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-ring = "0.17"
-# Pinned to 0.14.7: 0.14.8 bumps its own MSRV to rustc 1.88, above this crate's
+# The delegated-signer integration tests mint an in-memory test CA + server/client
+# certs. Pinned to 0.14.7: 0.14.8 bumps its own MSRV to rustc 1.88, above this crate's
 # declared rust-version 1.75. (Dev-dep only — never in a downstream consumer's build.)
-rcgen = { version = "=0.14.7", default-features = false, features = ["ring", "crypto"] }
+rcgen = { version = "=0.14.7", default-features = false, features = ["ring", "crypto", "pem"] }

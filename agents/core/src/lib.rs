@@ -46,4 +46,6 @@ pub use transport::{Fault, MockTransport, Outcome, Transport};
 pub use wal::Wal;
 
 #[cfg(feature = "https")]
-pub use transport::HttpsTransport;
+pub use transport::{
+    ClientAuthError, ClientAuthSigner, HttpsTransport, SignerError, SoftwareSigner,
+};
