@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http;
 using System.Net.Http.Json;
 using System.Runtime.Versioning;
 using System.Text.Json;
@@ -104,7 +105,7 @@ internal sealed class EnrollmentClient
     /// Union of the route's success body (<c>device_id</c>, <c>status</c>, <c>public_key_fingerprint</c>)
     /// and its error body (<c>error</c>, <c>detail</c>). Unset fields stay null.
     /// </summary>
-    private sealed class EnrollmentResponseDto
+    internal sealed class EnrollmentResponseDto
     {
         [JsonPropertyName("device_id")]
         public string? DeviceId { get; init; }
