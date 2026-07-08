@@ -291,6 +291,62 @@ class SyncSession(TimestampMixin, Base):
     ended_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
 
+# --------------------------------------------------------------------------- #
+# Device registry (mTLS enrollment)
+# --------------------------------------------------------------------------- #
+
+
+class Device(TimestampMixin, Base):
+    """An enrolled (or enrolling) device in the Cadence mTLS trust fabric.
+
+    A device row is created **pending** by the un-authenticated enrollment intake
+    (see :mod:`cadence.devices.enrollment`) and carries the device's own public key
+    (SPKI PEM) plus its fingerprint. Enrolling grants **no trust**: the row stays
+    ``pending`` — and no client certificate is issued — until a human explicitly
+    ``accept``s it (the operator flow lives in B2). ``status`` is the single source of
+    truth for whether a device is trusted; revocation is a status transition here
+    (there is no CRL yet).
+
+    This table holds only key/attestation **references and fingerprints**, never
+    verbatim raw content: ``public_key_pem`` is public crypto material and
+    ``attestation_ref`` is an opaque NAS pointer, not an inlined attestation blob.
+    Registry writes go straight through the local D1 session (not the raw-boundary /
+    replication write path) — security metadata stays local and is never shipped to
+    the Cloudflare replica.
+    """
+
+    __tablename__ = "device"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: SPKI (SubjectPublicKeyInfo) of the device key, PEM-encoded. Public material.
+    public_key_pem: Mapped[str] = mapped_column(Text, nullable=False)
+    #: SHA-256 (hex) of the DER SPKI — the stable dedupe/lookup key. Unique so a
+    #: re-enroll of the same key is idempotent rather than creating a duplicate row.
+    public_key_fingerprint: Mapped[str] = mapped_column(
+        String(128), nullable=False, unique=True, index=True
+    )
+    #: Trust state: "pending" (default, untrusted) | "accepted" | "revoked".
+    status: Mapped[str] = mapped_column(
+        String(32), default="pending", nullable=False, index=True
+    )
+    #: Provenance of the key material: "hardware" | "software" | "unknown".
+    key_provenance: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
+    #: How possession of the private key was proven at enrollment: "csr" | "dpop".
+    #: A device may not enroll without one of these (see cadence.devices.enrollment).
+    pop_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: The verified proof-of-possession itself (the CSR PEM or the dpop_proof), retained
+    #: for the B2 human-review audit trail rather than discarded after verification.
+    pop_proof: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: Fingerprint of the client cert issued to the device on accept (nullable until B2).
+    cert_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    #: Opaque NAS pointer to the raw attestation blob (never inlined into D1).
+    attestation_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    enrolled_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow, nullable=False)
+    #: When a human accepted/revoked the device (nullable while pending).
+    decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+
 #: All ORM model classes, in dependency order (useful for schema lint + tests).
 ALL_MODELS = (
     SourceAccount,
@@ -303,6 +359,7 @@ ALL_MODELS = (
     Nudge,
     Feedback,
     SyncSession,
+    Device,
 )
 
 __all__ = [
@@ -319,6 +376,7 @@ __all__ = [
     "Nudge",
     "Feedback",
     "SyncSession",
+    "Device",
     "ALL_MODELS",
     "utcnow",
     "UTCDateTime",

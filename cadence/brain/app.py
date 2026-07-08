@@ -31,6 +31,8 @@ from fastapi.responses import PlainTextResponse
 from cadence.adapters.base import Event
 from cadence.brain.deadlines import RuleDeadlineExtractor
 from cadence.config import Settings, get_settings
+from cadence.devices.enrollment import EnrollmentError, EnrollmentRequest, EnrollmentService
+from cadence.devices.registry import DeviceRegistry, PendingCapExceeded
 from cadence.ingest.pipeline import BackpressureError, IngestPipeline
 from cadence.obs.logging import get_logger
 from cadence.obs.metrics import render_prometheus
@@ -138,6 +140,46 @@ def create_app(
             "fact_id": result.fact_id,
             "deadlines_created": result.deadlines_created,
             "wal_offset": result.wal_offset,
+        }
+
+    @app.post("/device/enroll", status_code=201)
+    def device_enroll(
+        request: EnrollmentRequest,
+        response: Response,
+        pipe: IngestPipeline = Depends(get_pipeline),
+    ) -> dict:
+        """Un-authenticated device enrollment intake — **EXEMPT from enforce_mtls**.
+
+        This is the deliberate exception to the mTLS gate: an un-enrolled device has no
+        client certificate yet, so it cannot be behind :func:`require_mtls` (that would
+        be a chicken-and-egg deadlock). The exemption is safe because the endpoint is
+        powerless — it only ever records a single ``pending``, untrusted device row and
+        issues **no** certificate. Trust follows a Trust-On-First-Use + explicit human
+        accept model: a human operator reviews and accepts the pending device out of
+        band (the operator CLI + cert issuance are B2). See
+        :mod:`cadence.devices.enrollment`.
+
+        Idempotent on the key fingerprint, so retries / rate-limited clients re-POSTing
+        the same key map to the same row rather than growing the table.
+        """
+        registry = DeviceRegistry(pipe.d1, max_pending_devices=settings.max_pending_devices)
+        service = EnrollmentService(registry)
+        try:
+            device = service.enroll(request)
+        except EnrollmentError as exc:
+            response.status_code = 422
+            return {"accepted": False, "error": "invalid_enrollment", "detail": str(exc)}
+        except PendingCapExceeded as exc:
+            # Un-authenticated intake fails closed under storage-amplification pressure.
+            response.status_code = 429
+            return {"accepted": False, "error": "pending_capacity", "detail": str(exc)}
+        # `accepted`/`trusted` are always False here: enrolling never confers trust.
+        return {
+            "accepted": False,
+            "trusted": False,
+            "device_id": device.id,
+            "status": device.status,
+            "public_key_fingerprint": device.public_key_fingerprint,
         }
 
     @app.get("/healthz")

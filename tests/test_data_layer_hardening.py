@@ -27,7 +27,7 @@ from cadence.stores.raw_boundary import (
 
 EXPECTED_TABLES = {
     "calendar_event", "task", "deadline", "person", "place", "source_account",
-    "fact", "nudge", "feedback", "sync_session",
+    "fact", "nudge", "feedback", "sync_session", "device",
 }
 
 

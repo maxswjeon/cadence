@@ -136,6 +136,29 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Private CA / device enrollment (M8) -------------------------------
+    ca_leaf_validity_days: int = Field(
+        default=90,
+        description=(
+            "Validity window (days) for issued client/server leaf certs. Certs are "
+            "SHORT-LIVED by design; renewal is a later step. See cadence.devices.ca."
+        ),
+    )
+    ca_root_validity_days: int = Field(
+        default=3650,
+        description="Validity window (days) for the self-signed Cadence root CA cert.",
+    )
+    max_pending_devices: int = Field(
+        default=100,
+        description=(
+            "Cap on the number of devices in the 'pending' state. The /device/enroll "
+            "intake is un-authenticated (mTLS-exempt bootstrap), so this bounds "
+            "storage-amplification growth from anonymous callers: a NEW enrollment is "
+            "refused (429) once this many devices are already pending. Idempotent "
+            "re-POSTs of an already-known key are never counted against the cap."
+        ),
+    )
+
     # --- LLM inference (M4; OFF by default, shadow-gated until S0.2) --------
     llm_provider: str = Field(
         default="none",

@@ -18,6 +18,7 @@ EXPECTED_TABLES = {
     "nudge",
     "feedback",
     "sync_session",
+    "device",
 }
 
 
