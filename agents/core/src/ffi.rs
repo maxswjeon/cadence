@@ -30,7 +30,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::cell::RefCell;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 
@@ -201,6 +201,180 @@ fn build_transport(_cfg: &CoreConfig) -> Result<Box<dyn Transport>, String> {
     Err("cadence-agent-core built without the `https` feature; cannot open a transport".into())
 }
 
+// --------------------------------------------------------------------------- //
+// Delegated-signer (hardware-keystore) init path
+// --------------------------------------------------------------------------- //
+//
+// Mirrors the plain init above, but the client private key never crosses the boundary: it
+// stays in the platform's secure element (Windows CNG/TPM or a PKCS#11 token behind the C
+// ABI; Android StrongBox behind the JNI layer) and only the DER ECDSA-P256 signature comes
+// back through the callback. See the B1 `ClientAuthSigner` seam in `crate::transport`.
+
+/// The C sign-callback the platform registers with [`cadence_core_init_with_signer`].
+///
+/// Contract (matches the B1 [`ClientAuthSigner`](crate::transport::ClientAuthSigner) format):
+/// * `ctx` — the opaque context passed to `cadence_core_init_with_signer`, handed back
+///   unchanged (the platform's keystore handle). It MUST be safe to use from another thread
+///   (the TLS handshake runs on reqwest's internal blocking thread) and MUST outlive the
+///   handle. May be null if the callback needs no context.
+/// * `msg_ptr` / `msg_len` — the raw TLS CertificateVerify transcript bytes rustls wants
+///   signed. The platform hashes them with **SHA-256** and produces an **ASN.1-DER-encoded
+///   ECDSA-P256** signature (the `ecdsa_secp256r1_sha256` scheme) — exactly what a StrongBox
+///   / CNG / PKCS#11 P-256 key's `sign` returns.
+/// * `out_sig` / `out_sig_cap` — a caller-provided buffer of `out_sig_cap` bytes (always
+///   >= 72, the maximum DER ECDSA-P256 length) to write the signature into.
+/// * `out_sig_len` — set by the callback to the number of signature bytes written.
+/// * returns `0` on success; any non-zero value is a signing failure (keystore unavailable,
+///   user auth declined, key handle invalid, …). The handshake then fails closed and no
+///   panic crosses the FFI boundary.
+pub type CadenceSignCallback = extern "C" fn(
+    ctx: *mut c_void,
+    msg_ptr: *const u8,
+    msg_len: usize,
+    out_sig: *mut u8,
+    out_sig_cap: usize,
+    out_sig_len: *mut usize,
+) -> i32;
+
+/// A [`ClientAuthSigner`](crate::transport::ClientAuthSigner) that forwards each client-auth
+/// signature to a registered [`CadenceSignCallback`] plus an opaque context — the C ABI
+/// expression of the B1 hardware-keystore seam (Windows CNG/TPM or PKCS#11 over P/Invoke).
+///
+/// The private key never crosses the boundary: only the message goes out to the callback and
+/// the DER signature comes back.
+#[cfg(feature = "https")]
+pub struct CallbackSigner {
+    callback: CadenceSignCallback,
+    ctx: *mut c_void,
+}
+
+// SAFETY: `ctx` is an opaque handle the platform pledges (per the `CadenceSignCallback`
+// contract) is safe to use from the reqwest handshake thread, and `callback` is a plain
+// function pointer. rustls shares the resolved signer across the connection's threads, so
+// `CallbackSigner` must be `Send + Sync`.
+#[cfg(feature = "https")]
+unsafe impl Send for CallbackSigner {}
+#[cfg(feature = "https")]
+unsafe impl Sync for CallbackSigner {}
+
+#[cfg(feature = "https")]
+impl std::fmt::Debug for CallbackSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Opaque on purpose: never render the callback/context.
+        f.debug_struct("CallbackSigner").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "https")]
+impl crate::transport::ClientAuthSigner for CallbackSigner {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, crate::transport::SignerError> {
+        use crate::transport::SignerError;
+        // DER ECDSA-P256 signatures are at most 72 bytes; give generous headroom so a
+        // conforming platform never overflows. The buffer lives only on this stack frame —
+        // the key material exists solely inside the platform keystore.
+        const SIG_CAP: usize = 128;
+        let mut sig = [0u8; SIG_CAP];
+        let mut sig_len: usize = 0;
+        // Calling a safe `extern "C"` function pointer is itself safe; the platform is
+        // responsible (per the `CadenceSignCallback` contract) for the pointers it receives.
+        let rc = (self.callback)(
+            self.ctx,
+            message.as_ptr(),
+            message.len(),
+            sig.as_mut_ptr(),
+            SIG_CAP,
+            &mut sig_len,
+        );
+        if rc != 0 {
+            return Err(SignerError::new(format!(
+                "client-auth sign callback failed (rc={rc})"
+            )));
+        }
+        if sig_len > SIG_CAP {
+            // A misbehaving callback claiming it wrote more than the buffer holds — refuse
+            // rather than read past the buffer.
+            return Err(SignerError::new(format!(
+                "client-auth sign callback reported {sig_len} bytes > capacity {SIG_CAP}"
+            )));
+        }
+        Ok(sig[..sig_len].to_vec())
+    }
+}
+
+/// Config JSON for the delegated-signer init path ([`cadence_core_init_with_signer`]): the
+/// same shape as [`CoreConfig`] but **without** `client_identity_pem` (there is no exportable
+/// key). The client certificate chain is supplied as `cert_chain_pem` (leaf first); the
+/// matching private key stays behind the sign callback.
+#[cfg(feature = "https")]
+#[derive(Debug, Deserialize)]
+struct SignerCoreConfig {
+    wal_path: String,
+    capacity: usize,
+    base_url: String,
+    cert_chain_pem: String,
+    ca_pem: String,
+    #[serde(default)]
+    retry: Option<RetryConfig>,
+}
+
+/// Parse the signer-path config JSON and construct a live handle whose transport delegates
+/// its client-auth signature to `signer`. Shared by the C ABI ([`CallbackSigner`]) and the
+/// JNI layer (a Java `java.security.Signature`-backed signer).
+#[cfg(feature = "https")]
+pub(crate) fn init_with_signer_from_config_json(
+    config_json: &str,
+    signer: std::sync::Arc<dyn crate::transport::ClientAuthSigner>,
+) -> Result<Box<CadenceCore>, String> {
+    let cfg: SignerCoreConfig =
+        serde_json::from_str(config_json).map_err(|e| format!("invalid config json: {e}"))?;
+    let policy = cfg
+        .retry
+        .as_ref()
+        .map(RetryConfig::to_policy)
+        .unwrap_or_default();
+    let transport = crate::transport::HttpsTransport::with_client_auth_signer(
+        &cfg.base_url,
+        cfg.cert_chain_pem.as_bytes(),
+        signer,
+        cfg.ca_pem.as_bytes(),
+    )
+    .map_err(|e| format!("failed to build delegated-signer mTLS transport: {e}"))?;
+    let core = CadenceCore::from_parts(
+        PathBuf::from(&cfg.wal_path),
+        cfg.capacity,
+        Box::new(transport),
+        policy,
+    )
+    .map_err(|e| format!("failed to open core: {e}"))?;
+    Ok(Box::new(core))
+}
+
+/// Build a delegated-signer handle from the config JSON + a C sign callback. Only available
+/// with the `https` feature; without it, init reports an error rather than silently building
+/// nothing (mirrors [`build_transport`]).
+#[cfg(feature = "https")]
+fn init_signer_core(
+    json: &str,
+    callback: CadenceSignCallback,
+    ctx: *mut c_void,
+) -> Result<Box<CadenceCore>, String> {
+    let signer: std::sync::Arc<dyn crate::transport::ClientAuthSigner> =
+        std::sync::Arc::new(CallbackSigner { callback, ctx });
+    init_with_signer_from_config_json(json, signer)
+}
+
+#[cfg(not(feature = "https"))]
+fn init_signer_core(
+    _json: &str,
+    _callback: CadenceSignCallback,
+    _ctx: *mut c_void,
+) -> Result<Box<CadenceCore>, String> {
+    Err(
+        "cadence-agent-core built without the `https` feature; cannot build a delegated-signer transport"
+            .into(),
+    )
+}
+
 /// Parse the config JSON and construct a live handle. Shared by the C ABI and JNI `init`.
 pub(crate) fn init_from_config_json(config_json: &str) -> Result<Box<CadenceCore>, String> {
     let cfg: CoreConfig =
@@ -347,6 +521,69 @@ pub extern "C" fn cadence_core_init(config_json: *const c_char) -> *mut CadenceC
     })
     .unwrap_or_else(|_| {
         set_last_error(CadenceStatus::Error, "cadence_core_init: panic");
+        std::ptr::null_mut()
+    })
+}
+
+/// Initialize the core like [`cadence_core_init`], but with the client private key held
+/// behind a hardware keystore: the mTLS client-auth signature is produced by `sign_callback`
+/// (given `sign_ctx`) instead of an exportable PEM key. The config JSON is the same shape
+/// **minus** `client_identity_pem` and **plus** `cert_chain_pem` (the client certificate
+/// chain, leaf first). See [`CadenceSignCallback`] for the exact signing contract.
+///
+/// Returns a non-null `*mut CadenceCore` on success, or null on failure (see
+/// `cadence_core_last_error`). Handles built this way are used and freed exactly like those
+/// from [`cadence_core_init`].
+///
+/// # Safety
+/// `config_json` must be a valid, NUL-terminated C string (or null, which fails cleanly);
+/// `sign_callback` a valid function pointer honoring the [`CadenceSignCallback`] contract (or
+/// null, which fails cleanly); `sign_ctx` an opaque pointer the callback understands (it may
+/// be null if the callback ignores it) that outlives the returned handle.
+#[no_mangle]
+pub extern "C" fn cadence_core_init_with_signer(
+    config_json: *const c_char,
+    sign_callback: Option<CadenceSignCallback>,
+    sign_ctx: *mut c_void,
+) -> *mut CadenceCore {
+    catch_unwind(|| {
+        if config_json.is_null() {
+            set_last_error(
+                CadenceStatus::InvalidArg,
+                "cadence_core_init_with_signer: null config_json",
+            );
+            return std::ptr::null_mut();
+        }
+        let Some(callback) = sign_callback else {
+            set_last_error(
+                CadenceStatus::InvalidArg,
+                "cadence_core_init_with_signer: null sign_callback",
+            );
+            return std::ptr::null_mut();
+        };
+        // SAFETY: `config_json` is non-null (checked above); the FFI contract requires the
+        // caller to pass a valid NUL-terminated C string that outlives this call.
+        let cstr = unsafe { CStr::from_ptr(config_json) };
+        let json = match cstr.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                set_last_error(
+                    CadenceStatus::InvalidArg,
+                    "cadence_core_init_with_signer: config_json not utf-8",
+                );
+                return std::ptr::null_mut();
+            }
+        };
+        match init_signer_core(json, callback, sign_ctx) {
+            Ok(handle) => Box::into_raw(handle),
+            Err(msg) => {
+                set_last_error(CadenceStatus::Error, msg);
+                std::ptr::null_mut()
+            }
+        }
+    })
+    .unwrap_or_else(|_| {
+        set_last_error(CadenceStatus::Error, "cadence_core_init_with_signer: panic");
         std::ptr::null_mut()
     })
 }

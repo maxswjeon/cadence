@@ -37,6 +37,7 @@
 #ifndef CADENCE_AGENT_CORE_H
 #define CADENCE_AGENT_CORE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -69,6 +70,46 @@ typedef enum CadenceStatus {
  * Returns a non-NULL handle on success, or NULL on failure (see cadence_core_last_error()).
  */
 CadenceCore *cadence_core_init(const char *config_json);
+
+/*
+ * Delegated-signer client-auth callback (hardware-keystore seam).
+ *
+ * Invoked during the mTLS handshake so the client private key can stay inside a secure
+ * element (Windows CNG/TPM, a PKCS#11 token, …) and never be exported. The platform:
+ *   - receives `ctx` (the opaque pointer passed to cadence_core_init_with_signer, unchanged),
+ *   - hashes the `msg_len` bytes at `msg` with SHA-256 and signs with its P-256 key,
+ *   - writes the ASN.1-DER ECDSA-P256 signature into `out_sig` (capacity `out_sig_cap`, always
+ *     >= 72, the max DER length) and sets `*out_sig_len` to the byte count,
+ *   - returns 0 on success, or any non-zero value to fail the handshake closed.
+ *
+ * NOTE: the callback may run on an internal transport thread, so `ctx` must be usable off the
+ * calling thread and must outlive the handle.
+ */
+typedef int32_t (*CadenceSignCallback)(void *ctx,
+                                       const uint8_t *msg,
+                                       size_t msg_len,
+                                       uint8_t *out_sig,
+                                       size_t out_sig_cap,
+                                       size_t *out_sig_len);
+
+/*
+ * Initialize the core like cadence_core_init, but with the client private key held behind a
+ * hardware keystore: the client-auth signature is produced by `sign_callback` (given
+ * `sign_ctx`) instead of an exportable PEM key. The config JSON is the same shape as
+ * cadence_core_init's MINUS "client_identity_pem" and PLUS "cert_chain_pem" (the client
+ * certificate chain PEM, leaf first):
+ *   {
+ *     "wal_path": "...", "capacity": 10000, "base_url": "https://...",
+ *     "cert_chain_pem": "...",   (string, required — client cert chain PEM, NO private key)
+ *     "ca_pem": "...",           (string, required — pinned brain CA PEM)
+ *     "retry": { ... }           (object, optional)
+ *   }
+ * Returns a non-NULL handle on success, or NULL on failure (see cadence_core_last_error()).
+ * Handles built this way are captured/drained/freed exactly like cadence_core_init handles.
+ */
+CadenceCore *cadence_core_init_with_signer(const char *config_json,
+                                           CadenceSignCallback sign_callback,
+                                           void *sign_ctx);
 
 /* Compact and free the handle. NULL-safe. */
 void cadence_core_shutdown(CadenceCore *handle);

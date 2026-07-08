@@ -36,6 +36,19 @@ use crate::ffi::{
     CadenceStatus, CaptureOutcome,
 };
 
+// The delegated-signer (StrongBox) path additionally needs the `https` transport it wires the
+// signer into. Android builds both features; these imports and the `nativeInitWithSigner`
+// export below are gated so a `--no-default-features --features jni` build still compiles.
+#[cfg(feature = "https")]
+use jni::objects::{GlobalRef, JByteArray, JObject, JValue};
+#[cfg(feature = "https")]
+use jni::JavaVM;
+
+#[cfg(feature = "https")]
+use crate::ffi::init_with_signer_from_config_json;
+#[cfg(feature = "https")]
+use crate::transport::{ClientAuthSigner, SignerError};
+
 const CORE_EXCEPTION: &str = "com/cadence/agent/core/CoreException";
 const BACKPRESSURE_EXCEPTION: &str = "com/cadence/agent/core/BackpressureException";
 
@@ -79,6 +92,81 @@ fn read_jstring(env: &mut JNIEnv, s: &JString) -> Result<String, String> {
         .map_err(|e| format!("invalid java string argument: {e}"))
 }
 
+/// A [`ClientAuthSigner`] that calls back into a Java/Kotlin
+/// `com.cadence.agent.core.ClientAuthSigner` — the JNI expression of the B1 hardware-keystore
+/// seam ([`crate::ffi::CallbackSigner`] is its C-ABI sibling). The Java object wraps an
+/// Android **StrongBox** `java.security.Signature("SHA256withECDSA")` whose P-256 private key
+/// never leaves the secure element; only the message goes in and the DER signature comes out.
+///
+/// # Contract (Kotlin side)
+/// ```kotlin
+/// package com.cadence.agent.core
+/// interface ClientAuthSigner {
+///     /**
+///      * SHA-256 + sign the raw TLS CertificateVerify `message` with the StrongBox P-256
+///      * key, returning the ASN.1-DER ECDSA signature — i.e. exactly what
+///      * `Signature.getInstance("SHA256withECDSA")` over a StrongBox `PrivateKey` produces.
+///      * Throw to signal a signing failure (the mTLS handshake then fails closed).
+///      */
+///     fun sign(message: ByteArray): ByteArray
+/// }
+/// ```
+///
+/// **Device/emulator validation pending:** this path cannot be unit-tested without a live JVM
+/// and a StrongBox key, so it is compile-checked here and exercised on-device by the Android
+/// agent. The C-ABI sibling [`crate::ffi::CallbackSigner`] has full loopback-handshake test
+/// coverage proving the delegated-signer seam itself is correct.
+#[cfg(feature = "https")]
+struct JavaSigner {
+    /// Handle to the running JVM, used to attach the (reqwest-internal) signing thread.
+    vm: JavaVM,
+    /// Global ref to the Java `ClientAuthSigner` object (survives across threads/frames).
+    signer: GlobalRef,
+}
+
+#[cfg(feature = "https")]
+impl ClientAuthSigner for JavaSigner {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // rustls drives this on reqwest's internal blocking thread, which is NOT attached to
+        // the JVM. Attach it; the guard auto-detaches when it drops at end of scope.
+        let mut env = self
+            .vm
+            .attach_current_thread()
+            .map_err(|e| SignerError::new(format!("JNI attach_current_thread failed: {e}")))?;
+
+        let jmsg = env
+            .byte_array_from_slice(message)
+            .map_err(|e| SignerError::new(format!("JNI byte_array_from_slice failed: {e}")))?;
+
+        let result = env.call_method(
+            self.signer.as_obj(),
+            "sign",
+            "([B)[B",
+            &[JValue::Object(&jmsg)],
+        );
+
+        // Surface + clear any Java-side exception before inspecting the result, so the thread
+        // is never left with a pending exception when control returns to rustls.
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+            return Err(SignerError::new(
+                "java client-auth signer threw (StrongBox sign failed or key unavailable)",
+            ));
+        }
+
+        let obj = result
+            .and_then(|v| v.l())
+            .map_err(|e| SignerError::new(format!("JNI sign call failed: {e}")))?;
+        if obj.is_null() {
+            return Err(SignerError::new("java client-auth signer returned null"));
+        }
+
+        let arr = JByteArray::from(obj);
+        env.convert_byte_array(&arr)
+            .map_err(|e| SignerError::new(format!("JNI convert_byte_array failed: {e}")))
+    }
+}
+
 /// `com.cadence.agent.core.CoreBridge.nativeInit(String) -> long` (0 on failure).
 #[no_mangle]
 pub extern "system" fn Java_com_cadence_agent_core_CoreBridge_nativeInit<'local>(
@@ -107,6 +195,68 @@ pub extern "system" fn Java_com_cadence_agent_core_CoreBridge_nativeInit<'local>
     }))
     .unwrap_or_else(|_| {
         jni_set_last_error(CadenceStatus::Error, "nativeInit: panic");
+        0
+    })
+}
+
+/// `com.cadence.agent.core.CoreBridge.nativeInitWithSigner(String, ClientAuthSigner) -> long`
+/// (0 on failure, detail via `nativeLastError()`). Like `nativeInit`, but the client private
+/// key stays in Android StrongBox: the mTLS client-auth signature is produced by the Java
+/// `signer` (a `com.cadence.agent.core.ClientAuthSigner`, see [`JavaSigner`]). The config JSON
+/// is the [`crate::ffi`] signer-path shape — `cert_chain_pem` (client chain, leaf first),
+/// **no** `client_identity_pem`.
+///
+/// Device/emulator validation pending (needs a real StrongBox key); compiled + reviewed here.
+#[cfg(feature = "https")]
+#[no_mangle]
+pub extern "system" fn Java_com_cadence_agent_core_CoreBridge_nativeInitWithSigner<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config_json: JString<'local>,
+    signer: JObject<'local>,
+) -> jlong {
+    catch_unwind(AssertUnwindSafe(|| {
+        let json = match read_jstring(&mut env, &config_json) {
+            Ok(s) => s,
+            Err(msg) => {
+                jni_set_last_error(CadenceStatus::InvalidArg, msg);
+                return 0;
+            }
+        };
+        // Hold a JVM handle (to attach the signing thread later) and a global ref to the Java
+        // signer (to outlive this call and cross threads).
+        let vm = match env.get_java_vm() {
+            Ok(vm) => vm,
+            Err(e) => {
+                jni_set_last_error(
+                    CadenceStatus::Error,
+                    format!("nativeInitWithSigner: get_java_vm failed: {e}"),
+                );
+                return 0;
+            }
+        };
+        let global = match env.new_global_ref(&signer) {
+            Ok(g) => g,
+            Err(e) => {
+                jni_set_last_error(
+                    CadenceStatus::Error,
+                    format!("nativeInitWithSigner: new_global_ref failed: {e}"),
+                );
+                return 0;
+            }
+        };
+        let signer: std::sync::Arc<dyn ClientAuthSigner> =
+            std::sync::Arc::new(JavaSigner { vm, signer: global });
+        match init_with_signer_from_config_json(&json, signer) {
+            Ok(handle) => std::boxed::Box::into_raw(handle) as usize as jlong,
+            Err(msg) => {
+                jni_set_last_error(CadenceStatus::Error, msg);
+                0
+            }
+        }
+    }))
+    .unwrap_or_else(|_| {
+        jni_set_last_error(CadenceStatus::Error, "nativeInitWithSigner: panic");
         0
     })
 }
