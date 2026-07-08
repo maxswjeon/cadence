@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from _mtls_util import build_trust_fabric, new_key
 from fastapi.testclient import TestClient
 
 from cadence.brain.app import create_app
@@ -82,15 +83,30 @@ def test_mtls_required_by_default_rejects_missing_cert_header(store, settings) -
         assert r.status_code == 401
 
 
-def test_mtls_required_accepts_request_with_cert_header(store, settings) -> None:
+def test_mtls_required_accepts_request_with_verified_cert(store, settings) -> None:
+    # A present X-Client-Cert is now REALLY verified (chain-to-CA + accepted device),
+    # not merely checked for presence: an accepted device's CA-issued cert is allowed.
     settings = settings.model_copy(update={"require_mtls": True})
+    fabric = build_trust_fabric(store, settings)
+    _, cert_pem = fabric.accepted_device_cert(new_key())
     pipeline = IngestPipeline(store)
-    app = create_app(pipeline=pipeline, settings=settings)
+    app = create_app(pipeline=pipeline, settings=settings, verifier=fabric.verifier)
+    with TestClient(app) as c:
+        r = c.post("/ingest/event", json=_event_body(), headers={"X-Client-Cert": cert_pem})
+        assert r.status_code == 202
+
+
+def test_mtls_required_rejects_unverifiable_cert_header(store, settings) -> None:
+    # The presence-only stub is gone: a bogus header no longer passes the gate.
+    settings = settings.model_copy(update={"require_mtls": True})
+    fabric = build_trust_fabric(store, settings)
+    pipeline = IngestPipeline(store)
+    app = create_app(pipeline=pipeline, settings=settings, verifier=fabric.verifier)
     with TestClient(app) as c:
         r = c.post(
             "/ingest/event", json=_event_body(), headers={"X-Client-Cert": "dev-fixture-cert"}
         )
-        assert r.status_code == 202
+        assert r.status_code == 401
 
 
 def test_mtls_disabled_accepts_request_without_cert_header(client) -> None:
@@ -124,12 +140,15 @@ def test_non_loopback_no_cert_header_is_rejected(store, settings) -> None:
         assert r.status_code == 401
 
 
-def test_remote_with_cert_header_uses_existing_path(store, settings) -> None:
-    # A proxied remote device still forwards X-Client-Cert -> the cert path, not loopback.
-    with _ingest_client(store, settings, client_addr=("203.0.113.7", 40000)) as c:
-        r = c.post(
-            "/ingest/event", json=_event_body(), headers={"X-Client-Cert": "dev-fixture-cert"}
-        )
+def test_remote_with_verified_cert_uses_cert_path(store, settings) -> None:
+    # A proxied remote device forwards X-Client-Cert -> the cert path (not loopback); its
+    # accepted, CA-issued cert verifies and is allowed even from a non-loopback peer.
+    settings = settings.model_copy(update={"require_mtls": True})
+    fabric = build_trust_fabric(store, settings)
+    _, cert_pem = fabric.accepted_device_cert(new_key())
+    app = create_app(pipeline=IngestPipeline(store), settings=settings, verifier=fabric.verifier)
+    with TestClient(app, client=("203.0.113.7", 40000)) as c:
+        r = c.post("/ingest/event", json=_event_body(), headers={"X-Client-Cert": cert_pem})
         assert r.status_code == 202
 
 

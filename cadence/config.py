@@ -114,14 +114,15 @@ class Settings(BaseSettings):
         description="Daglo STT endpoint (not contacted in M1).",
     )
 
-    # --- mTLS gate (STUB — no real cert verification in M1) -----------------
+    # --- mTLS gate (real client-cert verification; see cadence.devices.verify) --
     require_mtls: bool = Field(
         default=True,
         description=(
-            "Fail-closed gate for the /ingest/event mTLS choke point (see "
-            "cadence.brain.app.create_app). True (default) rejects any request "
-            "missing the client-cert proof a TLS-terminating proxy would set; "
-            "set False only for local dev/tests where mTLS is not terminated."
+            "Fail-closed gate for the /ingest/event + /nudge feedback mTLS choke point "
+            "(see cadence.brain.app.enforce_mtls). True (default) rejects any request "
+            "whose client cert a TLS-terminating proxy forwards cannot be verified "
+            "against the Cadence CA + accepted-device registry; set False only for "
+            "local dev/tests where mTLS is not terminated."
         ),
     )
     trust_loopback_ingest: bool = Field(
@@ -133,6 +134,19 @@ class Settings(BaseSettings):
             "forwards the client-cert header for remote devices, so remote callers "
             "keep going through the cert path and never benefit from this exemption. "
             "Set False to require the cert header even for same-host callers."
+        ),
+    )
+    proxy_shared_secret: str | None = Field(
+        default=None,
+        description=(
+            "Shared secret proving a request came from the trusted TLS-terminating "
+            "proxy — the ONLY component that actually verified the client cert at the "
+            "transport layer. When set, the proxy must inject it as the "
+            "X-Cadence-Proxy-Auth header, and X-Client-Cert is honored ONLY on such a "
+            "proxy-authenticated request: a copied cert replayed by any other peer is "
+            "rejected (client certs are not secret). REQUIRED for any network-exposed "
+            "bind; unset, the gate MUST be run loopback-only behind a same-host proxy. "
+            "Compared in constant time. See cadence.brain.app.enforce_mtls."
         ),
     )
 

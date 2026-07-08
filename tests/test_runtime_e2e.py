@@ -145,14 +145,48 @@ def test_feedback_non_loopback_no_cert_header_is_rejected(store, settings) -> No
     assert resp.status_code == 401
 
 
-def test_feedback_remote_with_cert_header_uses_existing_path(store, settings) -> None:
-    c = _feedback_client(store, settings, client_addr=("203.0.113.7", 40000))
+def test_feedback_remote_with_verified_cert_uses_cert_path(store, settings) -> None:
+    # A remote device's accepted, CA-issued cert is really verified on the feedback route
+    # too (same DeviceVerifier as ingest); it passes the gate and 404s on the unknown nudge.
+    from _mtls_util import build_trust_fabric, new_key
+
+    settings = settings.model_copy(update={"require_mtls": True})
+    fabric = build_trust_fabric(store, settings)
+    _, cert_pem = fabric.accepted_device_cert(new_key())
+    runtime = CadenceRuntime(
+        config=RuntimeConfig(governor_mode="live"),
+        settings=settings,
+        store=store,
+        device_verifier=fabric.verifier,
+    )
+    c = TestClient(runtime.app, client=("203.0.113.7", 40000))
+    resp = c.post(
+        "/nudge/does-not-exist/feedback",
+        json={"kind": "thanks"},
+        headers={"X-Client-Cert": cert_pem},
+    )
+    assert resp.status_code == 404  # cert verified, gate passed, unknown nudge
+
+
+def test_feedback_unverifiable_cert_header_rejected(store, settings) -> None:
+    # The presence-only stub is gone: a bogus header no longer passes the feedback gate.
+    from _mtls_util import build_trust_fabric
+
+    settings = settings.model_copy(update={"require_mtls": True})
+    fabric = build_trust_fabric(store, settings)
+    runtime = CadenceRuntime(
+        config=RuntimeConfig(governor_mode="live"),
+        settings=settings,
+        store=store,
+        device_verifier=fabric.verifier,
+    )
+    c = TestClient(runtime.app, client=("203.0.113.7", 40000))
     resp = c.post(
         "/nudge/does-not-exist/feedback",
         json={"kind": "thanks"},
         headers={"X-Client-Cert": "dev-fixture-cert"},
     )
-    assert resp.status_code == 404  # cert path passed the gate, unknown nudge
+    assert resp.status_code == 401
 
 
 def test_feedback_loopback_exemption_off_rejects_loopback_no_cert(store, settings) -> None:

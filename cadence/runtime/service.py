@@ -36,9 +36,10 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from cadence.adapters.base import Event  # noqa: F401 - re-exported context for callers
-from cadence.brain.app import create_app, enforce_mtls
+from cadence.brain.app import build_device_verifier, create_app, enforce_mtls
 from cadence.brain.deadlines import DeadlineCandidate, RuleDeadlineExtractor
 from cadence.config import Settings, get_settings
+from cadence.devices.verify import DeviceVerifier
 from cadence.engine.engine import AttentionEngine
 from cadence.engine.governor import NudgeGovernor, ProposedNudge  # noqa: F401
 from cadence.ingest.pipeline import IngestPipeline
@@ -233,6 +234,7 @@ class CadenceRuntime:
         receptiveness_hook: ReceptivenessHook | None = None,
         deadline_calibration_source: DeadlineCalibrationSource | None = None,
         pollers: Sequence[SourcePoller] | None = None,
+        device_verifier: DeviceVerifier | None = None,
     ) -> None:
         self.config = config or RuntimeConfig()
         self.settings = settings or get_settings()
@@ -241,6 +243,16 @@ class CadenceRuntime:
             store = D1Store(self.settings)
             store.init_schema()
         self.store = store
+
+        # Real mTLS cert verification for BOTH the ingest and feedback routes, over the
+        # same D1. Built only when the gate is on (require_mtls); a pure-dev/test runtime
+        # leaves it None and a present X-Client-Cert then fails closed (see enforce_mtls).
+        if device_verifier is not None:
+            self.verifier: DeviceVerifier | None = device_verifier
+        elif self.settings.require_mtls:
+            self.verifier = build_device_verifier(self.settings, store)
+        else:
+            self.verifier = None
 
         # One governor instance is shared by the engine (writes nudges) and the feedback
         # route (adjusts the very thresholds those nudges fired against).
@@ -277,14 +289,15 @@ class CadenceRuntime:
         self._poller_threads: list[threading.Thread] = []
 
     def _build_app(self) -> FastAPI:
-        app = create_app(pipeline=self.pipeline, settings=self.settings)
+        app = create_app(pipeline=self.pipeline, settings=self.settings, verifier=self.verifier)
         governor = self.governor
         settings = self.settings
 
         def require_mtls(request: Request) -> None:
             # Same fail-closed choke point as the ingest route, including the loopback
-            # exemption for same-host pollers (see cadence.brain.app.enforce_mtls).
-            enforce_mtls(request, settings)
+            # exemption for same-host pollers and the SAME DeviceVerifier (real cert
+            # verification) — read off app.state so the lifespan-built one is shared.
+            enforce_mtls(request, settings, app.state.verifier)
 
         @app.post("/nudge/{nudge_id}/feedback")
         def nudge_feedback(
