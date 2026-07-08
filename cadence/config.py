@@ -76,16 +76,54 @@ class Settings(BaseSettings):
         ),
     )
 
-    # --- Cloudflare D1 replica (STUB — no real HTTP in M1) ------------------
+    # --- Cloudflare D1 replica ---------------------------------------------
+    # Real HTTP replication is OFF unless account_id + database_id + api_token are all
+    # set; unconfigured, the replica keeps its durable in-memory queue and makes NO
+    # network call (see cadence.stores.d1.CloudflareD1Replica.configured).
     cloudflare_d1_url: str | None = Field(
         default=None,
-        description="Cloudflare-D1 replica endpoint. Unused in M1; replica writes queue in memory.",
+        description=(
+            "Override for the Cloudflare API base (default "
+            "https://api.cloudflare.com/client/v4). Mainly for pointing tests at a fake "
+            "server; leave unset in production."
+        ),
     )
     cloudflare_account_id: str | None = Field(default=None)
+    cloudflare_d1_database_id: str | None = Field(
+        default=None,
+        description="Cloudflare D1 database id. Required (with account/token) to replicate.",
+    )
     cloudflare_api_token: str | None = Field(default=None)
     replication_queue_alarm_depth: int = Field(
         default=1000,
         description="Replication-queue depth that trips the replication_queue_depth alarm.",
+    )
+    replication_max_retries: int = Field(
+        default=3,
+        description="Max retries for a single replication op on transient (5xx/network) failure.",
+    )
+    replication_backoff_base: float = Field(
+        default=0.5,
+        description="Base seconds for exponential backoff between replication retries.",
+    )
+
+    # --- Cloudflare R2 (derived-blob object store) -------------------------
+    # Real S3-compatible transport is OFF unless bucket + access key/secret + an account
+    # id (or explicit endpoint) are set; unconfigured, R2Store writes to r2_dir locally
+    # and makes NO network call (see cadence.stores.r2.R2Store.configured).
+    r2_bucket: str | None = Field(
+        default=None,
+        description="R2 bucket name for derived blobs. Required to use real R2 transport.",
+    )
+    r2_access_key_id: str | None = Field(default=None)
+    r2_secret_access_key: str | None = Field(default=None)
+    r2_endpoint: str | None = Field(
+        default=None,
+        description=(
+            "Override for the R2 S3 endpoint (default "
+            "https://{cloudflare_account_id}.r2.cloudflarestorage.com). Mainly for "
+            "pointing tests at a fake server."
+        ),
     )
 
     # --- Deployment environment ---------------------------------------------
