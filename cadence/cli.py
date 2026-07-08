@@ -18,6 +18,7 @@ Commands:
   runtime      Run the brain: ingest API + attention engine + nudge delivery
   devbox       Poll this dev server for content-free, own-user signals (--once for one pass)
   onboarding   Store an LLM provider credential (--provider openai_api|chatgpt_oauth)
+  device       Operator console for the mTLS device trust fabric (requests|list|show|accept|revoke)
 
 Configuration is environment-based (CADENCE_* — see cadence/config.py and RuntimeConfig).
 Run `cadence <command> --help` where supported."""
@@ -47,6 +48,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if cmd == "onboarding":
         from cadence.onboarding.__main__ import main as _onboarding
         return _onboarding(rest)
+    if cmd == "device":
+        from cadence.devices.cli import main as _device
+        return _device(rest)
 
     print(f"cadence: unknown command {cmd!r}\n\n{_USAGE}", file=sys.stderr)
     return 2
