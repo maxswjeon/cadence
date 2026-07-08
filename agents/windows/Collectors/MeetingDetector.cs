@@ -1,3 +1,4 @@
+using Cadence.WindowsAgent.Compliance;
 using Cadence.WindowsAgent.Models;
 
 namespace Cadence.WindowsAgent.Collectors;
@@ -52,12 +53,22 @@ public sealed class MeetingDetector : IDisposable
     private readonly ActiveWindowCollector _activeWindowCollector;
     private readonly bool _ownsActiveWindowCollector;
 
+    // The single check BeginMeetingCaptureAsync consults. Defaults to the fail-closed
+    // DeniedComplianceGate (see Compliance/IComplianceGate.cs): the authoritative S0.5 decision
+    // lives in the brain (cadence.spikes.s0_5.ComplianceGate); this local gate is provisioned by
+    // that decision and stays DENIED until it is. Detection below never consults it — only
+    // capture does.
+    private readonly IComplianceGate _complianceGate;
+
     public event EventHandler<MeetingDetection>? MeetingDetected;
 
-    public MeetingDetector(ActiveWindowCollector? activeWindowCollector = null)
+    public MeetingDetector(
+        ActiveWindowCollector? activeWindowCollector = null,
+        IComplianceGate? complianceGate = null)
     {
         _ownsActiveWindowCollector = activeWindowCollector is null;
         _activeWindowCollector = activeWindowCollector ?? new ActiveWindowCollector();
+        _complianceGate = complianceGate ?? new DeniedComplianceGate();
         _activeWindowCollector.WindowChanged += OnWindowChanged;
     }
 
@@ -101,15 +112,39 @@ public sealed class MeetingDetector : IDisposable
         => MeetingDetected?.Invoke(this, new MeetingDetection(appName, info.Title, info.CapturedAt));
 
     /// <summary>
-    /// GATED — deliberately not implemented. Meeting audio/screen capture requires the
-    /// S0.5 compliance controls (participant-context confirm, visible/audible recording-state
-    /// indicator, one-tap stop, per-trigger audit log, non-participant abort/purge) that do not
-    /// exist yet anywhere in this codebase. Do not fill this in without those controls landing
-    /// first — see .omc/plans/cadence-consensus-plan.md Decision D / Phase 5 / AC-5.
+    /// GATED — capture stays refused, and even a permitted path stays unbuilt. This method
+    /// consults <see cref="IComplianceGate"/> (the single S0.5 check, see
+    /// Compliance/IComplianceGate.cs) and does nothing else: the gate defaults to
+    /// <see cref="DeniedComplianceGate"/>, so it refuses cleanly with the gate's reason. Meeting
+    /// audio/screen capture requires the S0.5 compliance controls (participant-context confirm,
+    /// visible/audible recording-state indicator, one-tap stop, per-trigger audit log,
+    /// non-participant abort/purge) that do not exist yet anywhere in this codebase — see
+    /// .omc/plans/cadence-consensus-plan.md Decision D / Phase 5 / AC-5.
+    ///
+    /// Honest posture: there is NO recording code here. If the gate is (hypothetically)
+    /// provisioned open, this still throws <see cref="NotImplementedException"/> rather than
+    /// recording, so no silent capture path exists even when permitted. Actual audio/screen
+    /// capture is the device-specific, post-sign-off step and is intentionally unbuilt.
     /// </summary>
     public Task BeginMeetingCaptureAsync(MeetingDetection detection, CancellationToken cancellationToken = default)
-        => throw new NotSupportedException(
-            "GATED: meeting audio/screen capture requires the S0.5 compliance-controls gate (Decision D, Phase 5) — not implemented.");
+    {
+        var decision = _complianceGate.CapturePermitted();
+        if (!decision.Permitted)
+        {
+            // Refuse cleanly with the gate's explainable reason. This is the expected path:
+            // the default gate is fail-closed (DENIED).
+            throw new NotSupportedException($"GATED: {decision.Reason}");
+        }
+
+        // Permitted only reaches here if a provisioned gate opened — but capture is still not
+        // built. Fail explicitly instead of recording so there is no silent capture path even
+        // when the gate permits it. Real audio/screen capture is the device-specific step that
+        // lands only after the S0.5 controls (and operator sign-off) are in place.
+        throw new NotImplementedException(
+            "GATE OPEN but capture is unbuilt: meeting audio/screen recording is the "
+            + "device-specific, post-S0.5-sign-off step and has not been implemented — refusing "
+            + "rather than silently recording (Decision D / Phase 5 / AC-5).");
+    }
 
     public void Dispose()
     {

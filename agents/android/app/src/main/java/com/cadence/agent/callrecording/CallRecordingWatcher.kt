@@ -2,6 +2,7 @@ package com.cadence.agent.callrecording
 
 import android.content.Context
 import android.os.FileObserver
+import android.util.Log
 
 /**
  * Watches the OEM call-recorder's output directory (Samsung/Korean-OEM native call
@@ -27,18 +28,39 @@ import android.os.FileObserver
  * Storage Access Framework or `MANAGE_EXTERNAL_STORAGE` rather than a plain
  * `FileObserver` on a raw path — not decided here, hence no storage permission is
  * declared in the manifest for this class yet.
+ *
+ * ## Honest posture (S0.5)
+ * Capture stays REFUSED. [start] consults [gate] — the single S0.5 check — FIRST, and the
+ * default [DeniedComplianceGate] denies, so no [FileObserver] is ever constructed and no
+ * file is opened/read/hashed. Even on the hypothetical permitted branch the actual
+ * watch/capture body is an explicit TODO(device): capture is unbuilt, not silently wired.
  */
-class CallRecordingWatcher(private val context: Context, private val recorderDirPath: String) {
+class CallRecordingWatcher(
+    private val context: Context,
+    private val recorderDirPath: String,
+    private val gate: ComplianceGate = DeniedComplianceGate,
+) {
 
     private var observer: FileObserver? = null
 
     fun start() {
-        // TODO(device, gated by S0.5): construct a FileObserver(File(recorderDirPath),
+        // Single S0.5 consult point. Default gate is DeniedComplianceGate, so this returns
+        // before any FileObserver is registered and before any file is opened/read/hashed —
+        // honoring the "must NOT touch files until S0.5-pass" contract above.
+        val decision = gate.capturePermitted()
+        if (!decision.permitted) {
+            Log.i(TAG, "call-recording watcher not started: ${decision.reason}")
+            return
+        }
+        // TODO(device, post-S0.5-sign-off): this branch is reachable only once the brain
+        // provisions a permitted decision; the real OEM-recorder watch is the
+        // device-specific step that stays unbuilt here — there is NO silent capture path
+        // even when permitted. It would construct a FileObserver(File(recorderDirPath),
         // FileObserver.CLOSE_WRITE) that, on a new file close-write event, ONLY records
         // (file name hash, discovered-at timestamp) — no file read — and enqueues a
         // "call_recording.discovered" event via
         // EventMapper.fromCallRecordingDiscovered(fileNameHash, discoveredAtMillis,
-        // deviceId, accountRef). The transcription/ingestion step itself must check an
+        // deviceId, accountRef). The transcription/ingestion step itself must ALSO check an
         // S0.5-pass flag before ever opening the file; until then this watcher is inert
         // observation only.
     }
@@ -46,5 +68,9 @@ class CallRecordingWatcher(private val context: Context, private val recorderDir
     fun stop() {
         observer?.stopWatching()
         observer = null
+    }
+
+    private companion object {
+        const val TAG = "CallRecordingWatcher"
     }
 }
