@@ -32,3 +32,15 @@ jni = { version = "0.21", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# --- M8 feasibility spike (delegated-signer mTLS) dev-deps -------------------
+# Named directly so the spike test can build a rustls ClientConfig/ServerConfig
+# and a custom SigningKey/Signer. Pinned to the SAME rustls 0.23 reqwest already
+# pulls (Cargo.lock: rustls 0.23.41) with the `ring` provider — NOT aws-lc-rs —
+# so `use_preconfigured_tls` accepts the config (exact-version downcast) and no
+# heavy C toolchain is dragged in. rcgen mints an in-memory test CA + certs;
+# `ring` performs the actual P-256 signature inside the "hardware" closure.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ring = "0.17"
+# Pinned to 0.14.7: 0.14.8 bumps its own MSRV to rustc 1.88, above this crate's
+# declared rust-version 1.75. (Dev-dep only — never in a downstream consumer's build.)
+rcgen = { version = "=0.14.7", default-features = false, features = ["ring", "crypto"] }
