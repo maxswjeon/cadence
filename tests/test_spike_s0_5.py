@@ -11,6 +11,7 @@ the user's (no counsel here), per user decision #3.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -19,6 +20,7 @@ from cadence.adapters.vault import FileCredentialVault
 from cadence.config import Settings
 from cadence.spikes.s0_5.audit import TriggerAuditLog
 from cadence.spikes.s0_5.codef_vault import CODEFBackoff, CODEFCredentialManager, CODEFLockedOut
+from cadence.spikes.s0_5.gate import ComplianceGate
 from cadence.spikes.s0_5.indicator import IndicatorState, InMemoryRecordingIndicator
 from cadence.spikes.s0_5.presence_gate import (
     BLEPresenceGate,
@@ -26,8 +28,14 @@ from cadence.spikes.s0_5.presence_gate import (
     OwnerVoiceprintEnrollment,
     StaticPresenceSource,
 )
-from cadence.spikes.s0_5.purge import InMemoryBufferPurgeHook, RetainedRecording, RetentionPurgeJob
+from cadence.spikes.s0_5.purge import (
+    InMemoryBufferPurgeHook,
+    NASBlobPurgeHook,
+    RetainedRecording,
+    RetentionPurgeJob,
+)
 from cadence.spikes.s0_5.recording_gate import ParticipantContext, RecordingGate, TriggerState
+from cadence.stores.nas import NASStore
 
 # --- recording gate (Decision D2) -------------------------------------------------- #
 
@@ -248,3 +256,188 @@ def test_codef_backoff_lockout_expires_after_the_delay() -> None:
     assert backoff.is_locked("acct", now) is True
     later = now + timedelta(seconds=31)
     assert backoff.is_locked("acct", later) is False
+
+
+# --- real NAS delete (irreversible, path-safe, audited) ---------------------------- #
+
+
+class _ListLogHandler(logging.Handler):
+    """Captures records directly (bypasses the ``cadence`` logger's ``propagate=False``)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def test_nas_delete_removes_exactly_the_addressed_blob(settings: Settings) -> None:
+    nas = NASStore(settings)
+    keep = nas.put(b"keep-me")
+    drop = nas.put(b"drop-me")
+
+    assert nas.delete(drop) is True
+
+    assert nas.exists(drop) is False
+    assert nas.exists(keep) is True  # only the addressed blob is gone
+    assert nas.get(keep) == b"keep-me"
+
+
+def test_nas_delete_is_idempotent_and_logs_the_event(settings: Settings) -> None:
+    nas = NASStore(settings)
+    ref = nas.put(b"buffered-recording-bytes")
+    handler = _ListLogHandler()
+    logger = logging.getLogger("cadence.stores.nas")
+    logger.addHandler(handler)
+    try:
+        assert nas.delete(ref, reason="non-participant confirmed present") is True
+        assert nas.delete(ref, reason="non-participant confirmed present") is False  # idempotent
+    finally:
+        logger.removeHandler(handler)
+
+    events = [r for r in handler.records if r.getMessage() == "nas_blob_deleted"]
+    assert len(events) == 1  # logged once, not for the already-absent second call
+    fields = events[0].extra_fields  # type: ignore[attr-defined]
+    assert fields["blob_id"] == ref.id
+    assert fields["hash"] == ref.hash
+    assert fields["reason"] == "non-participant confirmed present"
+
+
+@pytest.mark.parametrize("bad_id", ["../../etc/passwd", "/etc/passwd", "..", ""])
+def test_nas_delete_refuses_traversal_and_out_of_tree_ids(settings: Settings, bad_id: str) -> None:
+    nas = NASStore(settings)
+    with pytest.raises(ValueError):
+        nas.delete(bad_id)
+
+
+def test_nas_delete_refuses_a_symlink_escaping_the_tree(
+    settings: Settings, tmp_path
+) -> None:
+    nas = NASStore(settings)
+    outside = tmp_path / "outside_secret"
+    outside.write_bytes(b"do-not-touch")
+    digest = "a" * 64  # a well-formed content address whose file we make a symlink out
+    blob_path = nas.base_dir / digest[:2] / digest
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path.symlink_to(outside)
+
+    with pytest.raises(ValueError):
+        nas.delete(digest)  # resolves outside the NAS tree -> fail closed
+
+    assert outside.exists()  # the symlink target is never touched
+
+
+# --- purge wired to real NAS deletion ---------------------------------------------- #
+
+
+def test_non_participant_abort_deletes_the_nas_blob_via_wired_hook(settings: Settings) -> None:
+    nas = NASStore(settings)
+    audit = TriggerAuditLog()
+    indicator = InMemoryRecordingIndicator()
+    purge_hook = NASBlobPurgeHook(nas, audit, source="co_presence")
+    gate = RecordingGate(
+        countdown_ticks=1, audit=audit, indicator=indicator, purge_hook=purge_hook
+    )
+    gate.trigger("s1", "co_presence")
+    ref = purge_hook.write("s1", b"partial-audio-bytes")
+    assert nas.exists(ref) is True
+
+    gate.confirm_participant_context("s1", ParticipantContext.NON_PARTICIPANT_PRESENT)
+
+    assert nas.exists(ref) is False  # blob genuinely destroyed on disk, not just forgotten
+    assert purge_hook.blob_ids("s1") == []
+    events = [e.event for e in audit.for_session("s1")]
+    assert "aborted_non_participant" in events
+    assert "purged" in events
+
+
+def test_retention_expiry_deletes_the_nas_blob_via_wired_hook(settings: Settings) -> None:
+    nas = NASStore(settings)
+    audit = TriggerAuditLog()
+    purge_hook = NASBlobPurgeHook(nas, audit, source="meeting")
+    ref = purge_hook.write("old", b"expired-recording-bytes")
+    job = RetentionPurgeJob(audit=audit)
+    now = datetime.now(tz=UTC)
+    job.register(RetainedRecording("old", "meeting", now - timedelta(days=100), timedelta(days=90)))
+    assert nas.exists(ref) is True
+
+    purged = job.run(now, on_purge=purge_hook.retention_purger())
+
+    assert purged == ["old"]
+    assert nas.exists(ref) is False  # expired blob truly gone from disk
+    assert [e.event for e in audit.for_session("old")] == ["purged"]
+
+
+# --- application-level S0.5 compliance gate (CLOSED by default) --------------------- #
+
+
+def _full_controls(
+    settings: Settings,
+) -> tuple[RecordingGate, TriggerAuditLog, NASBlobPurgeHook, BLEPresenceGate]:
+    nas = NASStore(settings)
+    audit = TriggerAuditLog()
+    indicator = InMemoryRecordingIndicator()
+    purge_hook = NASBlobPurgeHook(nas, audit, source="co_presence")
+    recording_gate = RecordingGate(
+        countdown_ticks=1, audit=audit, indicator=indicator, purge_hook=purge_hook
+    )
+    presence_gate = BLEPresenceGate(StaticPresenceSource())
+    return recording_gate, audit, purge_hook, presence_gate
+
+
+def test_compliance_gate_is_closed_by_default(settings: Settings) -> None:
+    gate = ComplianceGate(settings=settings)  # s0_5_confirmed False, no controls wired
+    decision = gate.capture_permitted()
+    assert decision.permitted is False
+    assert "s0_5_confirmed is False" in decision.reason
+
+
+def test_compliance_gate_stays_closed_when_confirmed_but_controls_missing(
+    settings: Settings,
+) -> None:
+    confirmed = settings.model_copy(update={"s0_5_confirmed": True})
+    gate = ComplianceGate(settings=confirmed)  # confirmed, but nothing wired
+    decision = gate.capture_permitted()
+    assert decision.permitted is False
+    assert "not wired" in decision.reason
+
+
+def test_compliance_gate_rejects_a_purge_hook_without_a_real_delete(
+    settings: Settings,
+) -> None:
+    """An in-memory purge hook (no real NAS delete behind it) never satisfies the gate."""
+    confirmed = settings.model_copy(update={"s0_5_confirmed": True})
+    audit = TriggerAuditLog()
+    indicator = InMemoryRecordingIndicator()
+    in_mem_hook = InMemoryBufferPurgeHook(audit, source="co_presence")
+    recording_gate = RecordingGate(
+        countdown_ticks=1, audit=audit, indicator=indicator, purge_hook=in_mem_hook
+    )
+    gate = ComplianceGate(
+        settings=confirmed,
+        recording_gate=recording_gate,
+        audit=audit,
+        purge_hook=in_mem_hook,
+        presence_gate=BLEPresenceGate(StaticPresenceSource()),
+    )
+    decision = gate.capture_permitted()
+    assert decision.permitted is False
+    assert "real_delete" in decision.reason
+
+
+def test_compliance_gate_opens_only_with_confirmation_and_all_controls(
+    settings: Settings,
+) -> None:
+    confirmed = settings.model_copy(update={"s0_5_confirmed": True})
+    recording_gate, audit, purge_hook, presence_gate = _full_controls(confirmed)
+    gate = ComplianceGate(
+        settings=confirmed,
+        recording_gate=recording_gate,
+        audit=audit,
+        purge_hook=purge_hook,
+        presence_gate=presence_gate,
+    )
+    decision = gate.capture_permitted()
+    assert decision.permitted is True
+    assert "capture permitted" in decision.reason

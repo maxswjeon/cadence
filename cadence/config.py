@@ -142,6 +142,19 @@ class Settings(BaseSettings):
         description="Master key for the vault stub. Replace with an OS/HW keystore in prod.",
     )
 
+    # --- S0.5 compliance gate (capture stays refused until confirmed) ------
+    s0_5_confirmed: bool = Field(
+        default=False,
+        description=(
+            "Operator self-review sign-off (Decision #3) that the S0.5 compliance "
+            "controls are deployed and self-reviewed. Capture stays refused until the "
+            "operator confirms this; the ComplianceGate stays CLOSED by default and opens "
+            "only when this is True AND every required control is wired (recording gate, "
+            "audit log, real-delete purge hook, presence gate). No lawyer sign-off is or "
+            "is substituted for by this flag."
+        ),
+    )
+
     # --- STT / audio (interface only in M1; no recording/capture) ----------
     daglo_api_key: str | None = Field(
         default=None,

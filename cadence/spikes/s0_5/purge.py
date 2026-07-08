@@ -10,11 +10,11 @@ Two related but distinct controls from Decision D + S0.5:
   once it exceeds its configured TTL, proving retention is actually enforced rather
   than just documented.
 
-Neither module holds real audio: M1 excludes live recording (see ``AGENTS.md``), so
-these operate over a lightweight in-memory registry that stands in for "whatever the
-real recording pipeline would have written to NAS." A real implementation purges via
-:class:`cadence.stores.nas.NASStore`, which does not yet expose a delete — see
-``s0_5.md`` for that gap.
+M1 excludes live recording (see ``AGENTS.md``), so no real audio flows through here.
+:class:`InMemoryBufferPurgeHook` stands in for "captured bytes" with an in-memory dict,
+while :class:`NASBlobPurgeHook` is the real hook: it destroys the content-addressed
+recording blobs a real pipeline would have written to :class:`cadence.stores.nas.NASStore`
+by calling its irreversible, path-safe :meth:`~cadence.stores.nas.NASStore.delete`.
 """
 
 from __future__ import annotations
@@ -24,12 +24,19 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 
 from cadence.spikes.s0_5.audit import TriggerAuditLog
+from cadence.stores.nas import BlobRef, NASStore
 
 
 class PurgeHook(ABC):
     """Destroys whatever has been captured for ``session_id`` so far."""
+
+    #: Whether :meth:`purge` destroys durable on-disk evidence (a real NAS delete) rather
+    #: than an in-memory/test buffer. The :class:`~cadence.spikes.s0_5.gate.ComplianceGate`
+    #: refuses to open capture unless the wired purge hook is backed by a real delete.
+    backed_by_real_delete: ClassVar[bool] = False
 
     @abstractmethod
     def purge(self, session_id: str, *, reason: str) -> None: ...
@@ -49,6 +56,66 @@ class InMemoryBufferPurgeHook(PurgeHook):
     def purge(self, session_id: str, *, reason: str) -> None:
         self.buffers.pop(session_id, None)
         self._audit.record(session_id, self._source, "purged", detail=reason)
+
+
+class NASBlobPurgeHook(PurgeHook):
+    """Real purge hook: destroys the NAS-stored recording blobs for a session.
+
+    Captured chunks are written to the content-addressed :class:`NASStore`; the hook
+    tracks the resulting blob ids per session so an abort (``NON_PARTICIPANT_PRESENT``)
+    or a retention-TTL expiry can genuinely delete them from disk — not merely forget a
+    reference. Every deletion goes through :meth:`NASStore.delete` (path-safe, fail-closed,
+    audited as ``nas_blob_deleted``) and is idempotent, so a re-purge of an
+    already-destroyed session is a no-op.
+    """
+
+    backed_by_real_delete: ClassVar[bool] = True
+
+    def __init__(self, nas: NASStore, audit: TriggerAuditLog, *, source: str) -> None:
+        self._nas = nas
+        self._audit = audit
+        self._source = source
+        self._blobs: dict[str, list[str]] = {}
+
+    def write(self, session_id: str, chunk: bytes) -> BlobRef:
+        """Store a captured chunk in the NAS and track its blob id for later purge."""
+        ref = self._nas.put(chunk)
+        self._blobs.setdefault(session_id, []).append(ref.id)
+        return ref
+
+    def blob_ids(self, session_id: str) -> list[str]:
+        """The NAS blob ids currently tracked for ``session_id`` (empty once purged)."""
+        return list(self._blobs.get(session_id, []))
+
+    def delete_session(self, session_id: str, *, reason: str) -> int:
+        """Delete every tracked NAS blob for the session; return how many existed.
+
+        Idempotent: pops the tracking entry so a second call deletes nothing, and each
+        underlying :meth:`NASStore.delete` is itself idempotent for an already-absent blob.
+        """
+        deleted = 0
+        for blob_id in self._blobs.pop(session_id, []):
+            if self._nas.delete(blob_id, reason=reason):
+                deleted += 1
+        return deleted
+
+    def purge(self, session_id: str, *, reason: str) -> None:
+        self.delete_session(session_id, reason=reason)
+        self._audit.record(session_id, self._source, "purged", detail=reason)
+
+    def retention_purger(
+        self, *, reason: str = "retention TTL expired"
+    ) -> Callable[[str], None]:
+        """An ``on_purge`` callback for :class:`RetentionPurgeJob` that deletes NAS blobs.
+
+        The retention job audits the ``purged`` event itself, so this callback only
+        performs the (audited) NAS deletion — it must not double-record the audit entry.
+        """
+
+        def _purge(session_id: str) -> None:
+            self.delete_session(session_id, reason=reason)
+
+        return _purge
 
 
 @dataclass(frozen=True)
@@ -73,9 +140,10 @@ class RetainedRecording:
 class RetentionPurgeJob:
     """Sweeps registered recordings and purges (deletes) any past their TTL.
 
-    A real implementation calls into the raw-evidence store (NAS) to delete the
-    referenced blob; here ``on_purge`` is an injectable callback so the spike/tests can
-    verify destruction happened without a real store.
+    ``on_purge`` is an injectable per-session callback invoked before a recording is
+    marked purged; wire it to :meth:`NASBlobPurgeHook.retention_purger` so an expired
+    recording's content-addressed NAS blobs are genuinely deleted (via
+    :meth:`NASStore.delete`), not merely unregistered.
     """
 
     audit: TriggerAuditLog
@@ -124,6 +192,7 @@ class RetentionPurgeJob:
 __all__ = [
     "PurgeHook",
     "InMemoryBufferPurgeHook",
+    "NASBlobPurgeHook",
     "RetainedRecording",
     "RetentionPurgeJob",
 ]

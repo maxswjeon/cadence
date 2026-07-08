@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cadence.config import Settings, get_settings
+from cadence.obs.logging import get_logger, log_event
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,53 @@ class NASStore:
     def exists(self, ref: BlobRef | str) -> bool:
         digest = ref.id if isinstance(ref, BlobRef) else ref
         return self._path_for(digest).exists()
+
+    def _assert_within_nas_tree(self, digest: str) -> Path:
+        """Resolve a blob path and refuse anything escaping the NAS blob tree (fail closed).
+
+        Deletion is irreversible, so this positively validates that the addressed blob
+        resolves *strictly inside* ``base_dir`` — following symlinks — rather than trusting
+        the id. It rejects path traversal (``../``), an absolute-id escape, and a symlink
+        that points out of the tree, and refuses to resolve to ``base_dir`` itself (an empty
+        or too-short id). Mirrors the vault's ``_assert_within_nas_root`` posture: validate,
+        don't blocklist.
+        """
+        root = self.base_dir.resolve()
+        resolved = (self.base_dir / digest[:2] / digest).resolve()
+        if resolved == root or not resolved.is_relative_to(root):
+            raise ValueError(
+                f"blob id {digest!r} resolves to {resolved}, which escapes the NAS blob "
+                f"tree {root!r}; refusing (content-addressed ids never traverse or escape)"
+            )
+        return resolved
+
+    def delete(self, ref: BlobRef | str, *, reason: str = "") -> bool:
+        """Irreversibly delete exactly the addressed content blob. Returns whether it existed.
+
+        Path-safe and fail-closed: the blob path is resolved the same way reads are and
+        refused if it does not resolve strictly within the NAS blob tree (see
+        :meth:`_assert_within_nas_tree`). Idempotent — an already-absent blob returns
+        ``False`` without error. Every deletion is logged as a structured, non-verbatim
+        ``nas_blob_deleted`` event (id/hash + reason, never content).
+        """
+        digest = ref.id if isinstance(ref, BlobRef) else ref
+        resolved = self._assert_within_nas_tree(digest)
+        if not resolved.exists():
+            return False  # idempotent: already gone
+        if resolved.is_dir():
+            raise ValueError(
+                f"blob id {digest!r} resolves to a directory, not a content blob; refusing"
+            )
+        resolved.unlink()
+        log_event(
+            get_logger("stores.nas"),
+            20,  # logging.INFO
+            "nas_blob_deleted",
+            blob_id=digest,
+            hash=digest,
+            reason=reason,
+        )
+        return True
 
 
 __all__ = ["NASStore", "BlobRef", "sha256_hex"]
